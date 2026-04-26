@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+# =============================================================================
+# ociworker - Management CLI for OCI Worker
+# -----------------------------------------------------------------------------
+# Usage:
+#   ociworker                  Interactive menu
+#   ociworker status           Show status of oci-worker (+ webssh)
+#   ociworker start            Start services
+#   ociworker stop             Stop services
+#   ociworker restart          Restart oci-worker
+#   ociworker logs             Tail oci-worker logs
+#   ociworker config           Modify port / database (rollback on failure)
+#   ociworker update           Run install.sh in upgrade mode
+#   ociworker backup           Backup db dump + application.yml + keys
+#   ociworker restore <file>   Restore from a backup tarball
+#   ociworker uninstall        Uninstall everything (asks before each step)
+#   ociworker version          Show installer version + jar info
+#
+# WebSSH is started/stopped together with oci-worker automatically; there are
+# no separate webssh-on / webssh-off / logs-webssh commands by design.
+#
+# This script never modifies the database schema and never edits files outside
+# /opt/oci-worker, /etc/systemd/system/oci-worker*.service.
+# =============================================================================
+
+set -euo pipefail
+
+readonly INSTALL_DIR="/opt/oci-worker"
+readonly KEYS_DIR="${INSTALL_DIR}/keys"
+readonly BACKUP_DIR="${INSTALL_DIR}/backups"
+readonly CONFIG_FILE="${INSTALL_DIR}/application.yml"
+readonly JAR_NAME="oci-worker.jar"
+readonly SERVICE_NAME="oci-worker"
+readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly WEBSSH_SERVICE_NAME="oci-webssh"
+readonly WEBSSH_SERVICE_FILE="/etc/systemd/system/${WEBSSH_SERVICE_NAME}.service"
+readonly WEBSSH_BIN="${INSTALL_DIR}/oci-webssh"
+readonly WEBSSH_PORT=8008
+readonly REPO="OCIworker/OCIworker"
+readonly INSTALLER_RELEASE_TAG="installer-latest"
+readonly RAW_BASE="https://raw.githubusercontent.com/${REPO}/master"
+
+# -----------------------------------------------------------------------------
+# Colors / output
+# -----------------------------------------------------------------------------
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+    C_RED="$(tput setaf 1)"; C_GREEN="$(tput setaf 2)"; C_YELLOW="$(tput setaf 3)"
+    C_BLUE="$(tput setaf 4)"; C_CYAN="$(tput setaf 6)"; C_BOLD="$(tput bold)"; C_RESET="$(tput sgr0)"
+else
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_BOLD=""; C_RESET=""
+fi
+
+info()    { printf "%s[INFO]%s %s\n" "${C_BLUE}" "${C_RESET}" "$*"; }
+ok()      { printf "%s[ OK ]%s %s\n" "${C_GREEN}" "${C_RESET}" "$*"; }
+warn()    { printf "%s[WARN]%s %s\n" "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
+err()     { printf "%s[ERR ]%s %s\n" "${C_RED}" "${C_RESET}" "$*" >&2; }
+die()     { err "$*"; exit 1; }
+section() { printf "\n%s%s== %s ==%s\n" "${C_BOLD}" "${C_CYAN}" "$*" "${C_RESET}"; }
+
+ask() {
+    local prompt="$1" default="${2:-}" reply
+    if [ -n "${default}" ]; then printf "%s [%s]: " "${prompt}" "${default}" >&2
+    else printf "%s: " "${prompt}" >&2
+    fi
+    IFS= read -r reply </dev/tty || reply=""
+    [ -z "${reply}" ] && printf "%s" "${default}" || printf "%s" "${reply}"
+}
+ask_password() {
+    local prompt="$1" reply
+    printf "%s: " "${prompt}" >&2
+    IFS= read -r -s reply </dev/tty || reply=""
+    printf "\n" >&2
+    printf "%s" "${reply}"
+}
+ask_yes_no() {
+    local prompt="$1" default="${2:-Y}" hint reply
+    case "${default}" in Y|y) hint="[Y/n]";; N|n) hint="[y/N]";; *) hint="[y/n]";; esac
+    while true; do
+        printf "%s %s: " "${prompt}" "${hint}" >&2
+        IFS= read -r reply </dev/tty || reply=""
+        reply="${reply:-${default}}"
+        case "${reply}" in
+            Y|y|YES|yes|Yes) printf "y"; return 0 ;;
+            N|n|NO|no|No)    printf "n"; return 0 ;;
+            *) warn "请输入 y 或 n" ;;
+        esac
+    done
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then die "请用 root 运行：sudo ociworker $*"; fi
+}
+
+require_installed() {
+    if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${INSTALL_DIR}/${JAR_NAME}" ]; then
+        die "未检测到 OCI Worker 安装，请先运行 install.sh"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# YAML helpers (limited but safe for the application.yml we generate)
+# -----------------------------------------------------------------------------
+# Both yaml_get and yaml_set use python3 to walk the nested structure based on
+# indentation. This avoids brittle awk-based YAML editing and supports nested
+# paths like "spring.datasource.url".
+require_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        err "需要 python3：apt install python3 或 yum install python3"
+        return 2
+    fi
+}
+
+# yaml_get <dotted.path>     -- echoes the unquoted scalar value, or empty.
+# Examples:
+#   yaml_get server.port
+#   yaml_get web.account
+#   yaml_get spring.datasource.url
+yaml_get() {
+    require_python3 || return 2
+    local path="$1"
+    python3 - "$path" "$CONFIG_FILE" <<'PYEOF'
+import sys, re
+
+path, fpath = sys.argv[1:3]
+parts = path.split('.')
+
+with open(fpath, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+# Walk the file collecting (indent_level, key) for each non-blank, non-comment line.
+def parse_indent_key_value(line):
+    s = line.rstrip('\n')
+    if not s.strip() or s.lstrip().startswith('#'):
+        return None
+    indent = len(s) - len(s.lstrip(' '))
+    rest = s.strip()
+    m = re.match(r'^([A-Za-z0-9_\-]+):\s*(.*)$', rest)
+    if not m:
+        return None
+    return indent, m.group(1), m.group(2)
+
+# Stack of (indent, key) for the current path.
+stack = []
+for line in lines:
+    parsed = parse_indent_key_value(line)
+    if parsed is None:
+        continue
+    indent, key, value = parsed
+    while stack and stack[-1][0] >= indent:
+        stack.pop()
+    stack.append((indent, key))
+    cur_path = [k for _, k in stack]
+    if cur_path == parts and value != '':
+        # Strip surrounding double-quotes if present, unescape \" and \\.
+        v = value
+        if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+            v = v[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+        sys.stdout.write(v)
+        sys.exit(0)
+PYEOF
+}
+
+# yaml_set <dotted.path> <new_value>     -- replaces the scalar at the path.
+# The path must already exist (we never insert new keys).
+# Value is always written as a YAML double-quoted scalar.
+yaml_set() {
+    require_python3 || return 2
+    local path="$1" val="$2"
+    python3 - "$path" "$val" "$CONFIG_FILE" <<'PYEOF'
+import sys, re
+
+path, val, fpath = sys.argv[1:4]
+parts = path.split('.')
+
+def yaml_escape(s):
+    return s.replace('\\', '\\\\').replace('"', '\\"')
+
+with open(fpath, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+def parse_indent_key(line):
+    s = line.rstrip('\n')
+    if not s.strip() or s.lstrip().startswith('#'):
+        return None
+    indent = len(s) - len(s.lstrip(' '))
+    rest = s.strip()
+    m = re.match(r'^([A-Za-z0-9_\-]+):\s*(.*)$', rest)
+    if not m:
+        return None
+    return indent, m.group(1), m.group(2)
+
+stack = []
+new_lines = []
+replaced = False
+for line in lines:
+    parsed = parse_indent_key(line)
+    if parsed is None:
+        new_lines.append(line)
+        continue
+    indent, key, value = parsed
+    while stack and stack[-1][0] >= indent:
+        stack.pop()
+    stack.append((indent, key))
+    cur_path = [k for _, k in stack]
+    if (not replaced) and cur_path == parts:
+        new_lines.append(f'{" " * indent}{key}: "{yaml_escape(val)}"\n')
+        replaced = True
+    else:
+        new_lines.append(line)
+
+if not replaced:
+    sys.stderr.write(f'key {path} not found in {fpath}\n')
+    sys.exit(2)
+
+with open(fpath, 'w', encoding='utf-8') as f:
+    f.writelines(new_lines)
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------------------
+cmd_status() {
+    require_installed
+    section "服务状态"
+    systemctl --no-pager --lines=0 status "${SERVICE_NAME}" 2>/dev/null || true
+    if [ -f "${WEBSSH_SERVICE_FILE}" ]; then
+        echo
+        systemctl --no-pager --lines=0 status "${WEBSSH_SERVICE_NAME}" 2>/dev/null || true
+    fi
+    echo
+    section "基础信息"
+    echo "JAR:    $(ls -l "${INSTALL_DIR}/${JAR_NAME}" 2>/dev/null | awk '{print $5,$6,$7,$8}')"
+    echo "Config: ${CONFIG_FILE}"
+    echo "Port:   $(yaml_get server.port)"
+}
+
+cmd_start() {
+    require_root start
+    require_installed
+    [ -f "${WEBSSH_SERVICE_FILE}" ] && systemctl start "${WEBSSH_SERVICE_NAME}" || true
+    systemctl start "${SERVICE_NAME}"
+    ok "已启动"
+}
+
+cmd_stop() {
+    require_root stop
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    [ -f "${WEBSSH_SERVICE_FILE}" ] && systemctl stop "${WEBSSH_SERVICE_NAME}" 2>/dev/null || true
+    ok "已停止"
+}
+
+cmd_restart() {
+    require_root restart
+    require_installed
+    systemctl restart "${SERVICE_NAME}"
+    ok "已重启"
+}
+
+cmd_logs() {
+    require_installed
+    journalctl -u "${SERVICE_NAME}" -f --no-pager
+}
+
+cmd_config() {
+    require_root config
+    require_installed
+    section "修改配置"
+
+    local cur_port cur_db_url cur_db_user
+    cur_port="$(yaml_get server.port)"
+    cur_db_url="$(yaml_get spring.datasource.url)"
+    cur_db_user="$(yaml_get spring.datasource.username)"
+
+    echo "当前端口:     ${cur_port}"
+    echo "当前 DB URL:  ${cur_db_url}"
+    echo "当前 DB 用户: ${cur_db_user}"
+    echo
+    echo "[规则] 每次修改会自动重启服务验证新配置。"
+    echo "       启动失败会自动回滚到上一份 application.yml，无需手动停服。"
+    echo "       手动备份历史保存在 /opt/oci-worker/application.yml.bak.*"
+    echo
+    echo "[提示] 管理员账号/密码请在 Web 界面里修改（设置 -> 安全）。"
+    echo
+
+    local choice
+    PS3="选择要修改的项 (q 退出): "
+    select choice in "Web 端口" "数据库修改 / 迁移（地址/端口/库名/用户名/密码 一起改）" "退出"; do
+        case "${REPLY}" in
+            1)
+                local new_port; new_port="$(ask "新 Web 端口" "${cur_port}")"
+                if [[ ! "${new_port}" =~ ^[0-9]+$ ]] || [ "${new_port}" -lt 1 ] || [ "${new_port}" -gt 65535 ]; then
+                    warn "端口无效"; continue
+                fi
+                if [ "${new_port}" -eq "${WEBSSH_PORT}" ]; then warn "端口与 WebSSH 冲突"; continue; fi
+                _backup_and_apply server.port "${new_port}" || true
+                ;;
+            2)
+                _change_database || true
+                ;;
+            3|q|Q)
+                break
+                ;;
+            *) warn "请选择菜单项编号" ;;
+        esac
+    done
+}
+
+_change_database() {
+    section "数据库修改 / 迁移"
+    cat <<EOF
+[i] 把数据库地址、端口、库名、用户名、密码作为一个整体替换。
+    会一次性写入 application.yml 然后重启 oci-worker 验证。
+    启动失败会自动回滚到上一份配置。
+
+[!] 如果是把数据迁移到新库（比如换到面板自带的 MySQL）：
+    请先 ociworker backup，把 dump.sql 导入新库后再来切连接。
+    否则切到空库后，登录页会变成首次设置（账号/租户/任务等数据
+    看不到，本质是数据库被换走、新库还没数据）。
+
+EOF
+    if [ "$(ask_yes_no "继续修改数据库连接？" "Y")" != "y" ]; then
+        info "已取消"
+        return 1
+    fi
+
+    local cur_url cur_user
+    cur_url="$(yaml_get spring.datasource.url)"
+    cur_user="$(yaml_get spring.datasource.username)"
+
+    # Parse host / port / dbname out of jdbc:mysql://host:port/db?...
+    local cur_host cur_port cur_db
+    cur_host="$(echo "${cur_url}"  | sed -n 's#jdbc:mysql://\([^:/]*\).*#\1#p')"
+    cur_port="$(echo "${cur_url}"  | sed -n 's#jdbc:mysql://[^:/]*:\([0-9]*\)/.*#\1#p')"
+    cur_db="$(echo "${cur_url}"    | sed -n 's#.*/\([^?]*\).*#\1#p')"
+    [ -n "${cur_host}" ] || cur_host="127.0.0.1"
+    [ -n "${cur_port}" ] || cur_port="3306"
+    [ -n "${cur_db}"   ] || cur_db="oci_worker"
+
+    local host port db user pass
+    host="$(ask "数据库地址" "${cur_host}")"
+    port="$(ask "数据库端口" "${cur_port}")"
+    db="$(ask   "数据库名"   "${cur_db}")"
+    user="$(ask "数据库用户名" "${cur_user}")"
+    pass="$(ask_password "数据库密码（直接回车=保持当前密码不变）")"
+
+    local new_url
+    new_url="jdbc:mysql://${host}:${port}/${db}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+
+    # Atomic backup + multi-write + restart + rollback
+    local bak="${CONFIG_FILE}.bak.$(date +%s)"
+    cp -p "${CONFIG_FILE}" "${bak}"
+    info "已备份当前配置：${bak}"
+
+    if ! yaml_set spring.datasource.url "${new_url}"; then
+        err "url 写入失败，恢复"
+        cp -p "${bak}" "${CONFIG_FILE}"; return 1
+    fi
+    if ! yaml_set spring.datasource.username "${user}"; then
+        err "username 写入失败，恢复"
+        cp -p "${bak}" "${CONFIG_FILE}"; return 1
+    fi
+    if [ -n "${pass}" ]; then
+        if ! yaml_set spring.datasource.password "${pass}"; then
+            err "password 写入失败，恢复"
+            cp -p "${bak}" "${CONFIG_FILE}"; return 1
+        fi
+    fi
+
+    info "新配置已写入，正在重启服务测试连接..."
+    if systemctl restart "${SERVICE_NAME}"; then
+        local i
+        for i in 1 2 3 4 5; do
+            sleep 2
+            systemctl is-active --quiet "${SERVICE_NAME}" || { systemctl is-failed --quiet "${SERVICE_NAME}" && break; }
+        done
+        if systemctl is-active --quiet "${SERVICE_NAME}"; then
+            ok "数据库连接已切换并验证通过（备份保留：${bak}）"
+            return 0
+        fi
+    fi
+
+    warn "服务启动失败，回滚到上一份配置..."
+    cp -p "${bak}" "${CONFIG_FILE}"
+    systemctl restart "${SERVICE_NAME}" || true
+    err "已回滚。请查看：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    return 1
+}
+
+# Backup current yml, apply yaml_set, restart with rollback on failure.
+_backup_and_apply() {
+    local path="$1" val="$2"
+    local bak="${CONFIG_FILE}.bak.$(date +%s)"
+    cp -p "${CONFIG_FILE}" "${bak}"
+    if ! yaml_set "${path}" "${val}"; then
+        err "未能定位 ${path}，已撤销改动"
+        cp -p "${bak}" "${CONFIG_FILE}"; rm -f "${bak}"
+        return 1
+    fi
+    info "已写入 ${path}，正在重启服务测试..."
+    if systemctl restart "${SERVICE_NAME}"; then
+        # Wait briefly to confirm it stays up
+        local i
+        for i in 1 2 3 4 5; do
+            sleep 2
+            systemctl is-active --quiet "${SERVICE_NAME}" || { systemctl is-failed --quiet "${SERVICE_NAME}" && break; }
+        done
+        if systemctl is-active --quiet "${SERVICE_NAME}"; then
+            ok "修改生效（备份保留：${bak}）"
+            return 0
+        fi
+    fi
+    warn "服务启动失败，回滚..."
+    cp -p "${bak}" "${CONFIG_FILE}"
+    systemctl restart "${SERVICE_NAME}" || true
+    err "已回滚到上一版配置（${bak}）。请查看：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    return 1
+}
+
+cmd_update() {
+    require_root update
+    require_installed
+    section "运行升级"
+    info "下载并执行 install.sh（优先 master 分支，升级模式自动识别）..."
+    local tmp; tmp="$(mktemp)"
+    if curl -fsSL --connect-timeout 15 "${RAW_BASE}/install.sh" -o "${tmp}"; then
+        :
+    elif curl -fsSL --connect-timeout 15 \
+            "https://github.com/${REPO}/releases/download/${INSTALLER_RELEASE_TAG}/install.sh" \
+            -o "${tmp}"; then
+        :
+    else
+        rm -f "${tmp}"; die "install.sh 下载失败（master raw 与 release 都不可达）"
+    fi
+    bash "${tmp}"
+    rm -f "${tmp}"
+}
+
+cmd_backup() {
+    require_root backup
+    require_installed
+    mkdir -p "${BACKUP_DIR}"
+    local ts; ts="$(date +%Y%m%d-%H%M%S)"
+    local out="${BACKUP_DIR}/oci-worker-backup-${ts}.tar.gz"
+    local stage; stage="$(mktemp -d)"
+    trap "rm -rf '${stage}'" RETURN
+
+    info "备份配置和密钥..."
+    cp -a "${CONFIG_FILE}" "${stage}/application.yml"
+    [ -d "${KEYS_DIR}" ] && cp -a "${KEYS_DIR}" "${stage}/keys" || true
+
+    info "备份数据库..."
+    if ! command -v mysqldump >/dev/null 2>&1; then
+        warn "未安装 mysqldump，跳过数据库备份（仅备份配置和密钥）"
+    else
+        local jdbc db_user db_pass host port db
+        jdbc="$(yaml_get spring.datasource.url)"
+        db_user="$(yaml_get spring.datasource.username)"
+        db_pass="$(yaml_get spring.datasource.password)"
+        host="$(echo "${jdbc}" | sed -n 's#jdbc:mysql://\([^:/]*\).*#\1#p')"
+        port="$(echo "${jdbc}" | sed -n 's#jdbc:mysql://[^:]*:\([0-9]*\).*#\1#p')"
+        db="$(echo "${jdbc}"   | sed -n 's#jdbc:mysql://[^/]*/\([^?]*\).*#\1#p')"
+        [ -n "${port}" ] || port=3306
+        if MYSQL_PWD="${db_pass}" mysqldump -h"${host}" -P"${port}" -u"${db_user}" \
+                --single-transaction --routines --triggers \
+                --default-character-set=utf8mb4 \
+                "${db}" > "${stage}/db.sql" 2>/tmp/mysqldump.err; then
+            ok "数据库备份完成（$(stat -c%s "${stage}/db.sql" 2>/dev/null || echo "?") 字节）"
+        else
+            warn "mysqldump 失败：$(cat /tmp/mysqldump.err 2>/dev/null)"
+            rm -f "${stage}/db.sql"
+        fi
+    fi
+
+    tar -czf "${out}" -C "${stage}" . || die "打包失败"
+    ok "备份完成：${out}"
+    ls -lh "${out}"
+}
+
+cmd_restore() {
+    require_root restore
+    require_installed
+    local file="${1:-}"
+    [ -n "${file}" ] || die "用法：ociworker restore <backup-file.tar.gz>"
+    [ -f "${file}" ] || die "文件不存在：${file}"
+
+    warn "恢复将覆盖当前配置/密钥/数据库（不可逆）"
+    [ "$(ask_yes_no "确认继续？" "N")" = "y" ] || { info "已取消"; return 0; }
+
+    local stage; stage="$(mktemp -d)"
+    trap "rm -rf '${stage}'" RETURN
+    tar -xzf "${file}" -C "${stage}" || die "解压失败"
+
+    systemctl stop "${SERVICE_NAME}" || true
+
+    if [ -f "${stage}/application.yml" ]; then
+        cp -p "${CONFIG_FILE}" "${CONFIG_FILE}.bak.before-restore.$(date +%s)" 2>/dev/null || true
+        cp "${stage}/application.yml" "${CONFIG_FILE}"
+        chmod 600 "${CONFIG_FILE}"
+        ok "已恢复 application.yml"
+    fi
+    if [ -d "${stage}/keys" ]; then
+        rm -rf "${KEYS_DIR}"
+        cp -a "${stage}/keys" "${KEYS_DIR}"
+        ok "已恢复 keys/"
+    fi
+    if [ -f "${stage}/db.sql" ]; then
+        local jdbc db_user db_pass host port db
+        jdbc="$(yaml_get spring.datasource.url)"
+        db_user="$(yaml_get spring.datasource.username)"
+        db_pass="$(yaml_get spring.datasource.password)"
+        host="$(echo "${jdbc}" | sed -n 's#jdbc:mysql://\([^:/]*\).*#\1#p')"
+        port="$(echo "${jdbc}" | sed -n 's#jdbc:mysql://[^:]*:\([0-9]*\).*#\1#p')"
+        db="$(echo "${jdbc}"   | sed -n 's#jdbc:mysql://[^/]*/\([^?]*\).*#\1#p')"
+        [ -n "${port}" ] || port=3306
+        info "恢复数据库 ${db}@${host}:${port}..."
+        if MYSQL_PWD="${db_pass}" mysql -h"${host}" -P"${port}" -u"${db_user}" "${db}" < "${stage}/db.sql"; then
+            ok "数据库已恢复"
+        else
+            warn "数据库恢复失败，请手动查看 db.sql"
+            cp "${stage}/db.sql" "/tmp/oci-worker-restore-db.sql"
+            warn "已保留至 /tmp/oci-worker-restore-db.sql"
+        fi
+    fi
+
+    systemctl start "${SERVICE_NAME}"
+    ok "恢复完成"
+}
+
+cmd_uninstall() {
+    require_root uninstall
+    section "卸载 OCI Worker"
+    [ "$(ask_yes_no "确认要卸载 OCI Worker 吗？" "N")" = "y" ] || { info "已取消"; return 0; }
+
+    info "停止服务..."
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl stop "${WEBSSH_SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${WEBSSH_SERVICE_NAME}" 2>/dev/null || true
+    rm -f "${SERVICE_FILE}" "${WEBSSH_SERVICE_FILE}"
+    systemctl daemon-reload
+
+    if [ "$(ask_yes_no "删除 ${INSTALL_DIR}（含 application.yml、keys、JAR、备份）？" "N")" = "y" ]; then
+        rm -rf "${INSTALL_DIR}"
+        ok "已删除 ${INSTALL_DIR}"
+    else
+        info "保留 ${INSTALL_DIR}"
+    fi
+
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "oci-worker-mysql"; then
+        if [ "$(ask_yes_no "删除 Docker MySQL 容器 oci-worker-mysql？" "N")" = "y" ]; then
+            docker rm -f oci-worker-mysql >/dev/null 2>&1 || true
+            ok "MySQL 容器已删除"
+            if [ "$(ask_yes_no "也删除 MySQL 数据目录 /opt/oci-worker/data/mysql？" "N")" = "y" ]; then
+                rm -rf /opt/oci-worker/data/mysql
+                ok "数据目录已删除"
+            fi
+        fi
+    fi
+
+    if [ "$(ask_yes_no "删除管理脚本 ociworker？" "N")" = "y" ]; then
+        rm -f /usr/local/bin/ociworker
+        ok "已删除"
+    fi
+
+    ok "卸载完成"
+}
+
+cmd_version() {
+    section "版本信息"
+    [ -f "${INSTALL_DIR}/${JAR_NAME}" ] && ls -lh "${INSTALL_DIR}/${JAR_NAME}" || echo "JAR 未安装"
+    [ -f "${WEBSSH_BIN}" ] && ls -lh "${WEBSSH_BIN}" || echo "WebSSH 二进制未安装"
+    if command -v java >/dev/null 2>&1; then java -version 2>&1 | head -n 1; fi
+}
+
+# -----------------------------------------------------------------------------
+# Interactive menu
+# -----------------------------------------------------------------------------
+menu() {
+    # In interactive menu mode, individual command failures must not exit
+    # the whole script. Use `|| true` on every command invocation.
+    while true; do
+        section "OCI Worker 管理"
+        cat <<EOF
+  1) 查看状态        2) 启动        3) 停止        4) 重启
+  5) 查看实时日志    6) 修改配置（含回滚）
+  7) 备份            8) 恢复
+  9) 升级到最新版   10) 版本信息
+ 11) 卸载            0) 退出
+EOF
+        printf "> " >&2
+        local c; IFS= read -r c </dev/tty || break
+        case "${c}" in
+            1)  cmd_status         || true ;;
+            2)  cmd_start          || true ;;
+            3)  cmd_stop           || true ;;
+            4)  cmd_restart        || true ;;
+            5)  cmd_logs           || true ;;
+            6)  cmd_config         || true ;;
+            7)  cmd_backup         || true ;;
+            8)
+                local f; f="$(ask "备份文件路径")"
+                cmd_restore "${f}" || true
+                ;;
+            9)  cmd_update         || true ;;
+            10) cmd_version        || true ;;
+            11) cmd_uninstall      || true ;;
+            0|q|Q|exit) info "再见"; break ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Dispatch
+# -----------------------------------------------------------------------------
+usage() {
+    sed -n '2,30p' "$0"
+}
+
+main() {
+    if [ $# -eq 0 ]; then
+        menu
+        return
+    fi
+    local sub="$1"; shift || true
+    case "${sub}" in
+        status)        cmd_status ;;
+        start)         cmd_start ;;
+        stop)          cmd_stop ;;
+        restart)       cmd_restart ;;
+        logs)          cmd_logs ;;
+        config)        cmd_config ;;
+        update)        cmd_update ;;
+        backup)        cmd_backup ;;
+        restore)       cmd_restore "$@" ;;
+        uninstall)     cmd_uninstall ;;
+        version)       cmd_version ;;
+        menu)          menu ;;
+        -h|--help|help) usage ;;
+        *) err "未知命令：${sub}"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"
