@@ -1,11 +1,6 @@
 # OCI Worker
 
-基于 Spring Boot 3 + Vue 3 的 **Oracle Cloud (OCI) 管理面板**。本仓库**只放安装说明**；**主程序 JAR、安装脚本、WebSSH 二进制**在 [GitHub Releases](https://github.com/OCIworker/OCIworker/releases)：
-
-| Release 标签 | 内容（安装器会按标签下载） |
-|--------------|----------------------------|
-| `installer-latest` | `install.sh`、`ociworker`、Linux `amd64` / `arm64` 的 `oci-webssh` |
-| `latest` | 主程序 `oci-worker-1.0.0.jar`（升级与面板「检查更新」会用到） |
+基于 Spring Boot 3 + Vue 3 的 **Oracle Cloud (OCI) 管理面板**。
 
 > **v2 智能安装器**：向导部署，支持 1Panel / 宝塔已有 MySQL、数据库自检、配置改坏回滚、附带 `ociworker` 命令。详细说明见 [INSTALLER.md](./INSTALLER.md)。
 
@@ -53,7 +48,7 @@ sudo ociworker update
 ```
 
 或在 Web：**系统设置 → 系统更新**。  
-也可再运行之前的 `/tmp/install.sh`（**升级模式**会更新 JAR 和 WebSSH，**不随便覆盖**你现有的 `application.yml` 和数据库，具体以安装器行为为准）。
+也可再运行之前的 `/tmp/install.sh`（**升级模式**会更新 JAR 和 WebSSH，**不覆盖**你现有的 `application.yml` 和数据库，具体以安装器行为为准）。
 
 ---
 
