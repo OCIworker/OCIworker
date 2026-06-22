@@ -61,7 +61,7 @@ ociworker update
 向导第一步选 **1**，准备工作：
 
 1. 在面板里建库：库名 `oci_worker`，字符集 `utf8mb4 / utf8mb4_unicode_ci`
-2. 建用户：用户名 `ociworker`，授权到 `oci_worker` 库，**访问权限选"所有人(%)"**
+2. 建用户：用户名 `oci_worker`，授权到 `oci_worker` 库，**访问权限选"所有人(%)"**
    （选 localhost 会因为 `127.0.0.1` ≠ `localhost` 导致认证失败，向导会识别并提示）
 3. 把数据库连接密码记下来填进向导
 

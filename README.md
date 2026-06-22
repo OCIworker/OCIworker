@@ -139,7 +139,7 @@ ociworker backup
 
 # 2. 把 dump.sql 导入面板的新库
 cd /tmp && tar xzf /opt/oci-worker/backups/backup-*.tar.gz
-mysql -h127.0.0.1 -P<面板MySQL端口> -uociworker -p oci_worker < dump.sql
+mysql -h127.0.0.1 -P<面板MySQL端口> -uoci_worker -p oci_worker < dump.sql
 
 # 3. 切换到新数据库（一次性改完，自动重启验证 + 失败自动回滚，不用先停服）
 ociworker config   # 选 2) 数据库修改 / 迁移，按提示填新库的地址/端口/库名/用户名/密码
@@ -164,7 +164,7 @@ web:
 spring:
   datasource:
     url: jdbc:mysql://localhost:3306/oci_worker?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
-    username: ociworker
+    username: oci_worker
     password: ociworker123
 
 oci-cfg:
@@ -180,8 +180,8 @@ CREATE DATABASE IF NOT EXISTS oci_worker
   DEFAULT CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
 
-CREATE USER IF NOT EXISTS 'ociworker'@'%' IDENTIFIED BY 'ociworker123';
-GRANT ALL PRIVILEGES ON oci_worker.* TO 'ociworker'@'%';
+CREATE USER IF NOT EXISTS 'oci_worker'@'%' IDENTIFIED BY 'ociworker123';
+GRANT ALL PRIVILEGES ON oci_worker.* TO 'oci_worker'@'%';
 FLUSH PRIVILEGES;
 ```
 
