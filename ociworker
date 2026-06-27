@@ -35,7 +35,8 @@ readonly LEGACY_WEBSSH_SERVICE_FILE="/etc/systemd/system/${LEGACY_WEBSSH_SERVICE
 readonly REPO="OCIworker/OCIworker"
 readonly INSTALLER_RELEASE_TAG="installer-latest"
 readonly RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
-# install.sh 默认 Docker MySQL 容器名；tg-clean 在本机无 mysql 客户端时可经此容器连库
+# Default Docker MySQL container name used by install.sh. tg-clean can use this
+# container when the host does not have a mysql client.
 readonly OCI_MYSQL_CONTAINER="${OCI_MYSQL_CONTAINER:-oci-worker-mysql}"
 
 # -----------------------------------------------------------------------------
@@ -80,25 +81,26 @@ ask_yes_no() {
         case "${reply}" in
             Y|y|YES|yes|Yes) printf "y"; return 0 ;;
             N|n|NO|no|No)    printf "n"; return 0 ;;
-            *) warn "请输入 y 或 n" ;;
+            *) warn "Please enter y or n" ;;
         esac
     done
 }
 
 require_root() {
-    if [ "$(id -u)" -ne 0 ]; then die "请用 root 运行：sudo ociworker $*"; fi
+    if [ "$(id -u)" -ne 0 ]; then die "Please run as root: sudo ociworker $*"; fi
 }
 
 require_installed() {
     if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${INSTALL_DIR}/${JAR_NAME}" ]; then
-        die "未检测到 OCI Worker 安装，请先运行 install.sh"
+        die "OCI Worker installation was not detected. Please run install.sh first."
     fi
 }
 
-# 从 application.yml 读取与面板相同的数据库配置（仅需 python3，不要求本机 mysql 命令）。
+# Load the same database settings used by the web panel from application.yml.
+# This only requires python3; a host mysql client is not required.
 _mysql_load_cfg() {
-    require_python3 || die "需要 python3 才能读取 ${CONFIG_FILE}"
-    _MYSQL_JDBC="$(yaml_get spring.datasource.url)" || die "无法读取 ${CONFIG_FILE} 中的 spring.datasource.url"
+    require_python3 || die "python3 is required to read ${CONFIG_FILE}"
+    _MYSQL_JDBC="$(yaml_get spring.datasource.url)" || die "Unable to read spring.datasource.url from ${CONFIG_FILE}"
     _MYSQL_USER="$(yaml_get spring.datasource.username)"
     _MYSQL_PASS="$(yaml_get spring.datasource.password)"
     _MYSQL_HOST="$(echo "${_MYSQL_JDBC}" | sed -n 's#jdbc:mysql://\([^:/]*\).*#\1#p')"
@@ -106,7 +108,7 @@ _mysql_load_cfg() {
     _MYSQL_DB="$(echo "${_MYSQL_JDBC}"   | sed -n 's#jdbc:mysql://[^/]*/\([^?]*\).*#\1#p')"
     [ -n "${_MYSQL_HOST}" ] || _MYSQL_HOST="127.0.0.1"
     [ -n "${_MYSQL_PORT}" ] || _MYSQL_PORT="3306"
-    [ -n "${_MYSQL_DB}" ]   || die "无法从 JDBC URL 解析数据库名：${_MYSQL_JDBC}"
+    [ -n "${_MYSQL_DB}" ]   || die "Unable to parse the database name from JDBC URL: ${_MYSQL_JDBC}"
     _MYSQL_MODE=""
 }
 
@@ -147,7 +149,8 @@ _mysql_try_docker() {
     return 1
 }
 
-# 选定 host mysql 或 docker exec（与 install.sh 默认容器一致）。
+# Select either the host mysql client or docker exec, matching install.sh's
+# default container.
 _mysql_ensure_mode() {
     _mysql_load_cfg
     [ -n "${_MYSQL_MODE}" ] && return 0
@@ -157,18 +160,18 @@ _mysql_ensure_mode() {
     fi
     if _mysql_try_docker; then
         _MYSQL_MODE="docker"
-        info "本机未安装 mysql 或无法直连，已通过 Docker 容器 ${OCI_MYSQL_CONTAINER} 连接数据库"
+        info "The host mysql client is missing or cannot connect directly. Connected through Docker container ${OCI_MYSQL_CONTAINER}."
         return 0
     fi
-    err "无法连接数据库（${_MYSQL_USER}@${_MYSQL_HOST}:${_MYSQL_PORT}/${_MYSQL_DB}）"
+    err "Unable to connect to the database (${_MYSQL_USER}@${_MYSQL_HOST}:${_MYSQL_PORT}/${_MYSQL_DB})"
     if ! command -v mysql >/dev/null 2>&1; then
-        err "本机缺少 mysql 客户端，且未检测到运行中的 ${OCI_MYSQL_CONTAINER}"
-        die "请执行：apt install -y default-mysql-client；或启动 Docker MySQL 后重试。账号密码以 ${CONFIG_FILE} 为准。"
+        err "The host mysql client is missing and running container ${OCI_MYSQL_CONTAINER} was not detected."
+        die "Run: apt install -y default-mysql-client; or start Docker MySQL and retry. Credentials are read from ${CONFIG_FILE}."
     fi
     if _mysql_docker_available; then
-        die "Docker 容器 ${OCI_MYSQL_CONTAINER} 在运行，但账号/密码与 ${CONFIG_FILE} 不一致，请核对 spring.datasource.password"
+        die "Docker container ${OCI_MYSQL_CONTAINER} is running, but the credentials do not match ${CONFIG_FILE}. Check spring.datasource.password."
     fi
-    die "请核对 ${CONFIG_FILE} 中的 spring.datasource 与 MySQL 实际账号密码"
+    die "Check that spring.datasource in ${CONFIG_FILE} matches the actual MySQL credentials."
 }
 
 _mysql_invoke() {
@@ -181,18 +184,18 @@ _mysql_invoke() {
     if [ "${_MYSQL_MODE}" = docker ]; then
         if ! docker exec -i "${OCI_MYSQL_CONTAINER}" env MYSQL_PWD="${_MYSQL_PASS}" \
                 mysql -u"${_MYSQL_USER}" "${_MYSQL_DB}" "${extra[@]}" -e "${sql}" 2>"${errf}"; then
-            err "经 Docker ${OCI_MYSQL_CONTAINER} 执行 SQL 失败"
+            err "Failed to execute SQL through Docker ${OCI_MYSQL_CONTAINER}"
             sed 's/^/  /' "${errf}" >&2
             rm -f "${errf}"
-            die "请核对 ${CONFIG_FILE} 中的 spring.datasource 账号密码"
+            die "Check the spring.datasource credentials in ${CONFIG_FILE}."
         fi
     else
         if ! MYSQL_PWD="${_MYSQL_PASS}" mysql -h"${_MYSQL_HOST}" -P"${_MYSQL_PORT}" -u"${_MYSQL_USER}" \
                 "${_MYSQL_DB}" "${extra[@]}" -e "${sql}" 2>"${errf}"; then
-            err "数据库执行失败（${_MYSQL_USER}@${_MYSQL_HOST}:${_MYSQL_PORT}/${_MYSQL_DB}）"
+            err "Database execution failed (${_MYSQL_USER}@${_MYSQL_HOST}:${_MYSQL_PORT}/${_MYSQL_DB})"
             sed 's/^/  /' "${errf}" >&2
             rm -f "${errf}"
-            die "请核对 ${CONFIG_FILE} 与面板是否使用同一库"
+            die "Check whether ${CONFIG_FILE} and the web panel use the same database."
         fi
     fi
     rm -f "${errf}"
@@ -210,18 +213,18 @@ _mysql_scalar() {
     if [ "${_MYSQL_MODE}" = docker ]; then
         out="$(docker exec -i "${OCI_MYSQL_CONTAINER}" env MYSQL_PWD="${_MYSQL_PASS}" \
             mysql -u"${_MYSQL_USER}" "${_MYSQL_DB}" -N -e "${sql}" 2>"${errf}")" || {
-            err "经 Docker ${OCI_MYSQL_CONTAINER} 查询失败"
+            err "Query through Docker ${OCI_MYSQL_CONTAINER} failed"
             sed 's/^/  /' "${errf}" >&2
             rm -f "${errf}"
-            die "请核对 ${CONFIG_FILE} 中的 spring.datasource 账号密码"
+            die "Check the spring.datasource credentials in ${CONFIG_FILE}."
         }
     else
         out="$(MYSQL_PWD="${_MYSQL_PASS}" mysql -h"${_MYSQL_HOST}" -P"${_MYSQL_PORT}" -u"${_MYSQL_USER}" \
             "${_MYSQL_DB}" -N -e "${sql}" 2>"${errf}")" || {
-            err "数据库查询失败（${_MYSQL_USER}@${_MYSQL_HOST}:${_MYSQL_PORT}/${_MYSQL_DB}）"
+            err "Database query failed (${_MYSQL_USER}@${_MYSQL_HOST}:${_MYSQL_PORT}/${_MYSQL_DB})"
             sed 's/^/  /' "${errf}" >&2
             rm -f "${errf}"
-            die "请核对 ${CONFIG_FILE} 与面板是否使用同一库"
+            die "Check whether ${CONFIG_FILE} and the web panel use the same database."
         }
     fi
     rm -f "${errf}"
@@ -236,7 +239,7 @@ _mysql_scalar() {
 # paths like "spring.datasource.url".
 require_python3() {
     if ! command -v python3 >/dev/null 2>&1; then
-        err "需要 python3：apt install python3 或 yum install python3"
+        err "python3 is required: apt install python3 or yum install python3"
         return 2
     fi
 }
@@ -353,10 +356,10 @@ PYEOF
 # -----------------------------------------------------------------------------
 cmd_status() {
     require_installed
-    section "服务状态"
+    section "Service Status"
     systemctl --no-pager --lines=0 status "${SERVICE_NAME}" 2>/dev/null || true
     echo
-    section "基础信息"
+    section "Basic Information"
     echo "JAR:    $(ls -l "${INSTALL_DIR}/${JAR_NAME}" 2>/dev/null | awk '{print $5,$6,$7,$8}')"
     echo "Config: ${CONFIG_FILE}"
     echo "Port:   $(yaml_get server.port)"
@@ -366,20 +369,20 @@ cmd_start() {
     require_root start
     require_installed
     systemctl start "${SERVICE_NAME}"
-    ok "已启动"
+    ok "Started"
 }
 
 cmd_stop() {
     require_root stop
     systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-    ok "已停止"
+    ok "Stopped"
 }
 
 cmd_restart() {
     require_root restart
     require_installed
     systemctl restart "${SERVICE_NAME}"
-    ok "已重启"
+    ok "Restarted"
 }
 
 cmd_logs() {
@@ -390,32 +393,32 @@ cmd_logs() {
 cmd_config() {
     require_root config
     require_installed
-    section "修改配置"
+    section "Modify Configuration"
 
     local cur_port cur_db_url cur_db_user
     cur_port="$(yaml_get server.port)"
     cur_db_url="$(yaml_get spring.datasource.url)"
     cur_db_user="$(yaml_get spring.datasource.username)"
 
-    echo "当前端口:     ${cur_port}"
-    echo "当前 DB URL:  ${cur_db_url}"
-    echo "当前 DB 用户: ${cur_db_user}"
+    echo "Current port:     ${cur_port}"
+    echo "Current DB URL:   ${cur_db_url}"
+    echo "Current DB user:  ${cur_db_user}"
     echo
-    echo "[规则] 每次修改会自动重启服务验证新配置。"
-    echo "       启动失败会自动回滚到上一份 application.yml，无需手动停服。"
-    echo "       手动备份历史保存在 /opt/oci-worker/application.yml.bak.*"
+    echo "[Rule] Each change restarts the service to verify the new configuration."
+    echo "       If startup fails, the previous application.yml is restored automatically."
+    echo "       Manual backup history is stored at /opt/oci-worker/application.yml.bak.*"
     echo
-    echo "[提示] 管理员账号/密码请在 Web 界面里修改（设置 -> 安全）。"
+    echo "[Tip] Change the administrator account/password in the web UI (Settings -> Security)."
     echo
 
     local choice
-    PS3="选择要修改的项 (q 退出): "
-    select choice in "Web 端口" "数据库修改 / 迁移（地址/端口/库名/用户名/密码 一起改）" "退出"; do
+    PS3="Select an item to modify (q to quit): "
+    select choice in "Web port" "Database change / migration (host/port/database/user/password together)" "Exit"; do
         case "${REPLY}" in
             1)
-                local new_port; new_port="$(ask "新 Web 端口" "${cur_port}")"
+                local new_port; new_port="$(ask "New Web port" "${cur_port}")"
                 if [[ ! "${new_port}" =~ ^[0-9]+$ ]] || [ "${new_port}" -lt 1 ] || [ "${new_port}" -gt 65535 ]; then
-                    warn "端口无效"; continue
+                    warn "Invalid port"; continue
                 fi
                 _backup_and_apply server.port "${new_port}" || true
                 ;;
@@ -425,26 +428,28 @@ cmd_config() {
             3|q|Q)
                 break
                 ;;
-            *) warn "请选择菜单项编号" ;;
+            *) warn "Please select a menu item number" ;;
         esac
     done
 }
 
 _change_database() {
-    section "数据库修改 / 迁移"
+    section "Database Change / Migration"
     cat <<EOF
-[i] 把数据库地址、端口、库名、用户名、密码作为一个整体替换。
-    会一次性写入 application.yml 然后重启 oci-worker 验证。
-    启动失败会自动回滚到上一份配置。
+[i] The database host, port, database name, user, and password are replaced
+    as one complete connection profile. The script writes application.yml once,
+    then restarts oci-worker to verify it. If startup fails, the previous
+    configuration is restored automatically.
 
-[!] 如果是把数据迁移到新库（比如换到面板自带的 MySQL）：
-    请先 ociworker backup，把 dump.sql 导入新库后再来切连接。
-    否则切到空库后，登录页会变成首次设置（账号/租户/任务等数据
-    看不到，本质是数据库被换走、新库还没数据）。
+[!] If you are migrating data to a new database, such as a panel-managed MySQL:
+    run ociworker backup first, import dump.sql into the new database, and only
+    then switch the connection. Otherwise, switching to an empty database will
+    show the first-time setup page because account, tenant, task, and other
+    data still live in the old database.
 
 EOF
-    if [ "$(ask_yes_no "继续修改数据库连接？" "Y")" != "y" ]; then
-        info "已取消"
+    if [ "$(ask_yes_no "Continue changing the database connection?" "Y")" != "y" ]; then
+        info "Canceled"
         return 1
     fi
 
@@ -462,11 +467,11 @@ EOF
     [ -n "${cur_db}"   ] || cur_db="oci_worker"
 
     local host port db user pass
-    host="$(ask "数据库地址" "${cur_host}")"
-    port="$(ask "数据库端口" "${cur_port}")"
-    db="$(ask   "数据库名"   "${cur_db}")"
-    user="$(ask "数据库用户名" "${cur_user}")"
-    pass="$(ask_password "数据库密码（直接回车=保持当前密码不变）")"
+    host="$(ask "Database host" "${cur_host}")"
+    port="$(ask "Database port" "${cur_port}")"
+    db="$(ask   "Database name" "${cur_db}")"
+    user="$(ask "Database user" "${cur_user}")"
+    pass="$(ask_password "Database password (press Enter to keep the current password)")"
 
     local new_url
     new_url="jdbc:mysql://${host}:${port}/${db}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
@@ -474,24 +479,24 @@ EOF
     # Atomic backup + multi-write + restart + rollback
     local bak="${CONFIG_FILE}.bak.$(date +%s)"
     cp -p "${CONFIG_FILE}" "${bak}"
-    info "已备份当前配置：${bak}"
+    info "Current configuration backed up: ${bak}"
 
     if ! yaml_set spring.datasource.url "${new_url}"; then
-        err "url 写入失败，恢复"
+        err "Failed to write URL; restoring"
         cp -p "${bak}" "${CONFIG_FILE}"; return 1
     fi
     if ! yaml_set spring.datasource.username "${user}"; then
-        err "username 写入失败，恢复"
+        err "Failed to write username; restoring"
         cp -p "${bak}" "${CONFIG_FILE}"; return 1
     fi
     if [ -n "${pass}" ]; then
         if ! yaml_set spring.datasource.password "${pass}"; then
-            err "password 写入失败，恢复"
+            err "Failed to write password; restoring"
             cp -p "${bak}" "${CONFIG_FILE}"; return 1
         fi
     fi
 
-    info "新配置已写入，正在重启服务测试连接..."
+    info "New configuration written. Restarting service to test the connection..."
     if systemctl restart "${SERVICE_NAME}"; then
         local i
         for i in 1 2 3 4 5; do
@@ -499,15 +504,15 @@ EOF
             systemctl is-active --quiet "${SERVICE_NAME}" || { systemctl is-failed --quiet "${SERVICE_NAME}" && break; }
         done
         if systemctl is-active --quiet "${SERVICE_NAME}"; then
-            ok "数据库连接已切换并验证通过（备份保留：${bak}）"
+            ok "Database connection switched and verified (backup kept: ${bak})"
             return 0
         fi
     fi
 
-    warn "服务启动失败，回滚到上一份配置..."
+    warn "Service startup failed. Restoring the previous configuration..."
     cp -p "${bak}" "${CONFIG_FILE}"
     systemctl restart "${SERVICE_NAME}" || true
-    err "已回滚。请查看：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    err "Rolled back. Check: journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
     return 1
 }
 
@@ -517,11 +522,11 @@ _backup_and_apply() {
     local bak="${CONFIG_FILE}.bak.$(date +%s)"
     cp -p "${CONFIG_FILE}" "${bak}"
     if ! yaml_set "${path}" "${val}"; then
-        err "未能定位 ${path}，已撤销改动"
+        err "Could not locate ${path}; changes were reverted"
         cp -p "${bak}" "${CONFIG_FILE}"; rm -f "${bak}"
         return 1
     fi
-    info "已写入 ${path}，正在重启服务测试..."
+    info "Wrote ${path}. Restarting service to test..."
     if systemctl restart "${SERVICE_NAME}"; then
         # Wait briefly to confirm it stays up
         local i
@@ -530,22 +535,22 @@ _backup_and_apply() {
             systemctl is-active --quiet "${SERVICE_NAME}" || { systemctl is-failed --quiet "${SERVICE_NAME}" && break; }
         done
         if systemctl is-active --quiet "${SERVICE_NAME}"; then
-            ok "修改生效（备份保留：${bak}）"
+            ok "Change applied (backup kept: ${bak})"
             return 0
         fi
     fi
-    warn "服务启动失败，回滚..."
+    warn "Service startup failed. Rolling back..."
     cp -p "${bak}" "${CONFIG_FILE}"
     systemctl restart "${SERVICE_NAME}" || true
-    err "已回滚到上一版配置（${bak}）。请查看：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    err "Rolled back to the previous configuration (${bak}). Check: journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
     return 1
 }
 
 cmd_update() {
     require_root update
     require_installed
-    section "运行升级"
-    info "下载并执行 install.sh（优先 master 分支，升级模式自动识别）..."
+    section "Run Upgrade"
+    info "Downloading and running install.sh (main branch first; upgrade mode is auto-detected)..."
     local tmp; tmp="$(mktemp)"
     if curl -fsSL --connect-timeout 15 "${RAW_BASE}/install.sh" -o "${tmp}"; then
         :
@@ -554,7 +559,7 @@ cmd_update() {
             -o "${tmp}"; then
         :
     else
-        rm -f "${tmp}"; die "install.sh 下载失败（master raw 与 release 都不可达）"
+        rm -f "${tmp}"; die "Failed to download install.sh (main raw and release are both unreachable)"
     fi
     bash "${tmp}"
     rm -f "${tmp}"
@@ -569,13 +574,13 @@ cmd_backup() {
     local stage; stage="$(mktemp -d)"
     trap "rm -rf '${stage}'" RETURN
 
-    info "备份配置和密钥..."
+    info "Backing up configuration and keys..."
     cp -a "${CONFIG_FILE}" "${stage}/application.yml"
     [ -d "${KEYS_DIR}" ] && cp -a "${KEYS_DIR}" "${stage}/keys" || true
 
-    info "备份数据库..."
+    info "Backing up database..."
     if ! command -v mysqldump >/dev/null 2>&1; then
-        warn "未安装 mysqldump，跳过数据库备份（仅备份配置和密钥）"
+        warn "mysqldump is not installed. Skipping database backup (configuration and keys only)."
     else
         local jdbc db_user db_pass host port db
         jdbc="$(yaml_get spring.datasource.url)"
@@ -589,27 +594,27 @@ cmd_backup() {
                 --single-transaction --routines --triggers \
                 --default-character-set=utf8mb4 \
                 "${db}" > "${stage}/db.sql" 2>/tmp/mysqldump.err; then
-            ok "数据库备份完成（$(stat -c%s "${stage}/db.sql" 2>/dev/null || echo "?") 字节）"
+            ok "Database backup completed ($(stat -c%s "${stage}/db.sql" 2>/dev/null || echo "?") bytes)"
         else
-            warn "mysqldump 失败：$(cat /tmp/mysqldump.err 2>/dev/null)"
+            warn "mysqldump failed: $(cat /tmp/mysqldump.err 2>/dev/null)"
             rm -f "${stage}/db.sql"
         fi
     fi
 
-    tar -czf "${out}" -C "${stage}" . || die "打包失败"
-    ok "备份完成：${out}"
+    tar -czf "${out}" -C "${stage}" . || die "Failed to package backup"
+    ok "Backup completed: ${out}"
     ls -lh "${out}"
 }
 
 cmd_tg_clean() {
     require_root tg-clean
     require_installed
-    section "清除 Telegram 绑定"
+    section "Clear Telegram Binding"
     _mysql_ensure_mode
     if [ "${_MYSQL_MODE}" = docker ]; then
-        info "数据库：${_MYSQL_USER}@${OCI_MYSQL_CONTAINER}/${_MYSQL_DB}（Docker，配置来自 ${CONFIG_FILE}）"
+        info "Database: ${_MYSQL_USER}@${OCI_MYSQL_CONTAINER}/${_MYSQL_DB} (Docker; configuration from ${CONFIG_FILE})"
     else
-        info "数据库：${_MYSQL_USER}@${_MYSQL_HOST}:${_MYSQL_PORT}/${_MYSQL_DB}（来自 ${CONFIG_FILE}）"
+        info "Database: ${_MYSQL_USER}@${_MYSQL_HOST}:${_MYSQL_PORT}/${_MYSQL_DB} (from ${CONFIG_FILE})"
     fi
 
     local has_token has_chat
@@ -617,41 +622,41 @@ cmd_tg_clean() {
     has_chat="$(_mysql_scalar "SELECT COUNT(*) FROM oci_kv WHERE type='sys' AND code='tg_chat_id' AND COALESCE(TRIM(value),'') <> '' AND TRIM(value) NOT LIKE '%****%';")"
 
     if [ "${has_token}" != "1" ] || [ "${has_chat}" != "1" ]; then
-        warn "未检测到完整绑定（需同时存在有效的 tg_bot_token 与 tg_chat_id）"
-        echo "当前 oci_kv 中 TG 相关项："
+        warn "Complete binding was not detected (valid tg_bot_token and tg_chat_id are both required)."
+        echo "Current TG-related items in oci_kv:"
         _mysql_exec "SELECT code,
             CASE
-              WHEN value IS NULL OR TRIM(value) = '' THEN '(空)'
-              WHEN value LIKE '%****%' THEN '(脱敏占位，非真实 Token)'
-              ELSE CONCAT(LEFT(value, 6), '…(', CHAR_LENGTH(value), ' 字符)')
+              WHEN value IS NULL OR TRIM(value) = '' THEN '(empty)'
+              WHEN value LIKE '%****%' THEN '(masked placeholder, not a real token)'
+              ELSE CONCAT(LEFT(value, 6), '...(', CHAR_LENGTH(value), ' chars)')
             END AS value_hint
           FROM oci_kv WHERE type='sys' AND code LIKE 'tg_%' ORDER BY code;" || true
-        if [ "$(ask_yes_no "仍要删除所有 tg_% 配置项（含通知类型等）？" "N")" != "y" ]; then
-            info "已取消。"
+        if [ "$(ask_yes_no "Delete all tg_% configuration items anyway, including notification types?" "N")" != "y" ]; then
+            info "Canceled."
             return 0
         fi
     else
-        echo "将删除数据库中的 Bot Token、Chat ID、getUpdates offset 及其它 tg_% 项。"
-        echo "清除后：面板保存通知配置将不再要求 TG 验证码，直至重新绑定。"
-        [ "$(ask_yes_no "确认清除 Telegram 绑定？" "N")" = "y" ] || { info "已取消"; return 0; }
+        echo "This will delete the Bot Token, Chat ID, getUpdates offset, and other tg_% items from the database."
+        echo "After clearing, saving notification settings in the panel will not require a TG verification code until Telegram is bound again."
+        [ "$(ask_yes_no "Confirm clearing the Telegram binding?" "N")" = "y" ] || { info "Canceled"; return 0; }
     fi
     _mysql_exec "DELETE FROM oci_kv WHERE type='sys' AND code LIKE 'tg_%';"
-    ok "telegram通知已清除，请登录面板重新绑定。"
+    ok "Telegram notification settings have been cleared. Please log in to the panel and bind Telegram again."
 }
 
 cmd_restore() {
     require_root restore
     require_installed
     local file="${1:-}"
-    [ -n "${file}" ] || die "用法：ociworker restore <backup-file.tar.gz>"
-    [ -f "${file}" ] || die "文件不存在：${file}"
+    [ -n "${file}" ] || die "Usage: ociworker restore <backup-file.tar.gz>"
+    [ -f "${file}" ] || die "File does not exist: ${file}"
 
-    warn "恢复将覆盖当前配置/密钥/数据库（不可逆）"
-    [ "$(ask_yes_no "确认继续？" "N")" = "y" ] || { info "已取消"; return 0; }
+    warn "Restore will overwrite the current configuration, keys, and database. This cannot be undone."
+    [ "$(ask_yes_no "Continue?" "N")" = "y" ] || { info "Canceled"; return 0; }
 
     local stage; stage="$(mktemp -d)"
     trap "rm -rf '${stage}'" RETURN
-    tar -xzf "${file}" -C "${stage}" || die "解压失败"
+    tar -xzf "${file}" -C "${stage}" || die "Failed to extract backup"
 
     systemctl stop "${SERVICE_NAME}" || true
 
@@ -659,12 +664,12 @@ cmd_restore() {
         cp -p "${CONFIG_FILE}" "${CONFIG_FILE}.bak.before-restore.$(date +%s)" 2>/dev/null || true
         cp "${stage}/application.yml" "${CONFIG_FILE}"
         chmod 600 "${CONFIG_FILE}"
-        ok "已恢复 application.yml"
+        ok "Restored application.yml"
     fi
     if [ -d "${stage}/keys" ]; then
         rm -rf "${KEYS_DIR}"
         cp -a "${stage}/keys" "${KEYS_DIR}"
-        ok "已恢复 keys/"
+        ok "Restored keys/"
     fi
     if [ -f "${stage}/db.sql" ]; then
         local jdbc db_user db_pass host port db
@@ -675,26 +680,26 @@ cmd_restore() {
         port="$(echo "${jdbc}" | sed -n 's#jdbc:mysql://[^:]*:\([0-9]*\).*#\1#p')"
         db="$(echo "${jdbc}"   | sed -n 's#jdbc:mysql://[^/]*/\([^?]*\).*#\1#p')"
         [ -n "${port}" ] || port=3306
-        info "恢复数据库 ${db}@${host}:${port}..."
+        info "Restoring database ${db}@${host}:${port}..."
         if MYSQL_PWD="${db_pass}" mysql -h"${host}" -P"${port}" -u"${db_user}" "${db}" < "${stage}/db.sql"; then
-            ok "数据库已恢复"
+            ok "Database restored"
         else
-            warn "数据库恢复失败，请手动查看 db.sql"
+            warn "Database restore failed. Please inspect db.sql manually."
             cp "${stage}/db.sql" "/tmp/oci-worker-restore-db.sql"
-            warn "已保留至 /tmp/oci-worker-restore-db.sql"
+            warn "Saved to /tmp/oci-worker-restore-db.sql"
         fi
     fi
 
     systemctl start "${SERVICE_NAME}"
-    ok "恢复完成"
+    ok "Restore completed"
 }
 
 cmd_uninstall() {
     require_root uninstall
-    section "卸载 OCI Worker"
-    [ "$(ask_yes_no "确认要卸载 OCI Worker 吗？" "N")" = "y" ] || { info "已取消"; return 0; }
+    section "Uninstall OCI Worker"
+    [ "$(ask_yes_no "Are you sure you want to uninstall OCI Worker?" "N")" = "y" ] || { info "Canceled"; return 0; }
 
-    info "停止服务..."
+    info "Stopping services..."
     systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
     systemctl stop "${LEGACY_WEBSSH_SERVICE_NAME}" 2>/dev/null || true
     systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
@@ -703,35 +708,35 @@ cmd_uninstall() {
     rm -f "${INSTALL_DIR}/oci-webssh"
     systemctl daemon-reload
 
-    if [ "$(ask_yes_no "删除 ${INSTALL_DIR}（含 application.yml、keys、JAR、备份）？" "N")" = "y" ]; then
+    if [ "$(ask_yes_no "Delete ${INSTALL_DIR}, including application.yml, keys, JAR, and backups?" "N")" = "y" ]; then
         rm -rf "${INSTALL_DIR}"
-        ok "已删除 ${INSTALL_DIR}"
+        ok "Deleted ${INSTALL_DIR}"
     else
-        info "保留 ${INSTALL_DIR}"
+        info "Kept ${INSTALL_DIR}"
     fi
 
     if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "oci-worker-mysql"; then
-        if [ "$(ask_yes_no "删除 Docker MySQL 容器 oci-worker-mysql？" "N")" = "y" ]; then
+        if [ "$(ask_yes_no "Delete Docker MySQL container oci-worker-mysql?" "N")" = "y" ]; then
             docker rm -f oci-worker-mysql >/dev/null 2>&1 || true
-            ok "MySQL 容器已删除"
-            if [ "$(ask_yes_no "也删除 MySQL 数据目录 /opt/oci-worker/data/mysql？" "N")" = "y" ]; then
+            ok "MySQL container deleted"
+            if [ "$(ask_yes_no "Also delete MySQL data directory /opt/oci-worker/data/mysql?" "N")" = "y" ]; then
                 rm -rf /opt/oci-worker/data/mysql
-                ok "数据目录已删除"
+                ok "Data directory deleted"
             fi
         fi
     fi
 
-    if [ "$(ask_yes_no "删除管理脚本 ociworker？" "N")" = "y" ]; then
+    if [ "$(ask_yes_no "Delete the ociworker management script?" "N")" = "y" ]; then
         rm -f /usr/local/bin/ociworker
-        ok "已删除"
+        ok "Deleted"
     fi
 
-    ok "卸载完成"
+    ok "Uninstall completed"
 }
 
 cmd_version() {
-    section "版本信息"
-    [ -f "${INSTALL_DIR}/${JAR_NAME}" ] && ls -lh "${INSTALL_DIR}/${JAR_NAME}" || echo "JAR 未安装"
+    section "Version Information"
+    [ -f "${INSTALL_DIR}/${JAR_NAME}" ] && ls -lh "${INSTALL_DIR}/${JAR_NAME}" || echo "JAR is not installed"
     if command -v java >/dev/null 2>&1; then java -version 2>&1 | head -n 1; fi
 }
 
@@ -742,14 +747,14 @@ menu() {
     # In interactive menu mode, individual command failures must not exit
     # the whole script. Use `|| true` on every command invocation.
     while true; do
-        section "OCI Worker 管理"
+        section "OCI Worker Management"
         cat <<EOF
-  1) 查看状态        2) 启动        3) 停止        4) 重启
-  5) 查看实时日志    6) 修改配置（含回滚）
-  7) 备份            8) 恢复
-  9) 升级到最新版   10) 版本信息
- 11) 清除Tg绑定    12) 卸载
-  0) 退出
+  1) Status           2) Start        3) Stop         4) Restart
+  5) Live logs        6) Configure (with rollback)
+  7) Backup           8) Restore
+  9) Upgrade latest  10) Version
+ 11) Clear TG binding 12) Uninstall
+  0) Exit
 EOF
         printf "> " >&2
         local c; IFS= read -r c </dev/tty || break
@@ -762,15 +767,15 @@ EOF
             6)  cmd_config         || true ;;
             7)  cmd_backup         || true ;;
             8)
-                local f; f="$(ask "备份文件路径")"
+                local f; f="$(ask "Backup file path")"
                 cmd_restore "${f}" || true
                 ;;
             9)  cmd_update         || true ;;
             10) cmd_version        || true ;;
             11) cmd_tg_clean       || true ;;
             12) cmd_uninstall      || true ;;
-            0|q|Q|exit) info "再见"; break ;;
-            *) warn "无效选项" ;;
+            0|q|Q|exit) info "Goodbye"; break ;;
+            *) warn "Invalid option" ;;
         esac
     done
 }
@@ -803,7 +808,7 @@ main() {
         version)       cmd_version ;;
         menu)          menu ;;
         -h|--help|help) usage ;;
-        *) err "未知命令：${sub}"; usage; exit 1 ;;
+        *) err "Unknown command: ${sub}"; usage; exit 1 ;;
     esac
 }
 

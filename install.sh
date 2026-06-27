@@ -112,7 +112,7 @@ ask_yes_no() {
         case "${reply}" in
             Y|y|YES|yes|Yes) printf "y"; return 0 ;;
             N|n|NO|no|No)    printf "n"; return 0 ;;
-            *) warn "请输入 y 或 n" ;;
+            *) warn "Please enter y or n" ;;
         esac
     done
 }
@@ -126,14 +126,14 @@ ask_choice() {
         printf "  %d) %s\n" "$((i+1))" "${options[$i]}" >&2
     done
     while true; do
-        printf "请选择 [%s]: " "${default}" >&2
+        printf "Please select [%s]: " "${default}" >&2
         IFS= read -r reply </dev/tty || reply=""
         reply="${reply:-${default}}"
         if [[ "${reply}" =~ ^[0-9]+$ ]] && [ "${reply}" -ge 1 ] && [ "${reply}" -le "${#options[@]}" ]; then
             printf "%s" "${reply}"
             return 0
         fi
-        warn "请输入 1-${#options[@]} 的数字"
+        warn "Please enter a number from 1 to ${#options[@]}"
     done
 }
 
@@ -142,13 +142,13 @@ ask_choice() {
 # -----------------------------------------------------------------------------
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        die "请以 root 身份运行：sudo bash install.sh"
+        die "Please run as root: sudo bash install.sh"
     fi
 }
 
 require_systemd() {
     if ! command -v systemctl >/dev/null 2>&1; then
-        die "未检测到 systemd，本脚本只支持基于 systemd 的 Linux（Debian/Ubuntu/CentOS 等）"
+        die "systemd was not detected. This script only supports systemd-based Linux distributions such as Debian, Ubuntu, and CentOS."
     fi
 }
 
@@ -158,7 +158,7 @@ detect_arch() {
     case "${arch}" in
         x86_64|amd64)  echo "amd64" ;;
         aarch64|arm64) echo "arm64" ;;
-        *) die "不支持的 CPU 架构：${arch}（仅支持 amd64 和 arm64）" ;;
+        *) die "Unsupported CPU architecture: ${arch} (only amd64 and arm64 are supported)" ;;
     esac
 }
 
@@ -167,7 +167,7 @@ detect_jdk_arch() {
     case "$(uname -m)" in
         x86_64|amd64)  echo "x64" ;;
         aarch64|arm64) echo "aarch64" ;;
-        *) die "不支持的 CPU 架构" ;;
+        *) die "Unsupported CPU architecture" ;;
     esac
 }
 
@@ -187,7 +187,7 @@ pkg_install() {
              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
         dnf) dnf install -y -q "$@" ;;
         yum) yum install -y -q "$@" ;;
-        *)   warn "未识别的包管理器，跳过安装：$*" ;;
+        *)   warn "Unrecognized package manager. Skipping installation: $*" ;;
     esac
 }
 
@@ -195,8 +195,8 @@ ensure_cmd() {
     # ensure_cmd <cmd> [pkg-name]
     local cmd="$1" pkg="${2:-$1}"
     if ! command -v "${cmd}" >/dev/null 2>&1; then
-        info "未找到 ${cmd}，尝试安装 ${pkg}..."
-        pkg_install "${pkg}" || warn "安装 ${pkg} 失败，请手动安装后重试"
+        info "${cmd} was not found. Trying to install ${pkg}..."
+        pkg_install "${pkg}" || warn "Failed to install ${pkg}. Please install it manually and retry."
     fi
 }
 
@@ -233,10 +233,10 @@ java_is_21() {
 
 install_jdk21() {
     if java_is_21; then
-        ok "JDK 21 已安装：$(java_version_line)"
+        ok "JDK 21 is already installed: $(java_version_line)"
         return 0
     fi
-    info "安装 JDK 21 (Adoptium Temurin)..."
+    info "Installing JDK 21 (Adoptium Temurin)..."
     ensure_cmd curl
     ensure_cmd tar
     local jdk_arch tmp
@@ -245,15 +245,15 @@ install_jdk21() {
     if ! curl -fSL --retry 3 --retry-delay 5 --connect-timeout 15 \
             -o "${tmp}" \
             "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-${JDK_VERSION_URLENC}/OpenJDK21U-jre_${jdk_arch}_linux_hotspot_${JDK_VERSION_FILE}.tar.gz"; then
-        die "JDK 下载失败，请检查网络（GitHub 是否可访问）"
+        die "Failed to download JDK. Check network access to GitHub."
     fi
     mkdir -p "${JDK_INSTALL_BASE}"
-    tar -xzf "${tmp}" -C "${JDK_INSTALL_BASE}" || die "JDK 解压失败"
+    tar -xzf "${tmp}" -C "${JDK_INSTALL_BASE}" || die "Failed to extract JDK"
     local jdk_dir
     jdk_dir="$(ls -d "${JDK_INSTALL_BASE}"/jdk-21* 2>/dev/null | sort -V | tail -n 1 || true)"
-    [ -n "${jdk_dir}" ] || die "JDK 安装目录未找到"
+    [ -n "${jdk_dir}" ] || die "JDK installation directory was not found"
     ln -sf "${jdk_dir}/bin/java" /usr/local/bin/java
-    ok "JDK 21 安装完成 ($(java_version_line))"
+    ok "JDK 21 installation completed ($(java_version_line))"
 }
 
 # -----------------------------------------------------------------------------
@@ -376,7 +376,7 @@ docker_mysql_select1_status() {
 }
 
 wait_docker_mysql_user() {
-    info "等待 MySQL 就绪（最多 60 秒）..."
+    info "Waiting for MySQL to become ready (up to 60 seconds)..."
     local waited=0 status consecutive=0
     while [ "${waited}" -lt 60 ]; do
         if ! docker_mysql_logs_final_ready; then
@@ -391,13 +391,13 @@ wait_docker_mysql_user() {
             ok)
                 consecutive=$((consecutive + 1))
                 if [ "${consecutive}" -ge 2 ]; then
-                    ok "MySQL 已就绪"
+                    ok "MySQL is ready"
                     return 0
                 fi
                 ;;
             auth_fail)
                 printf "\n" >&2
-                die "MySQL 已启动，但用户名或密码错误。复用容器时请填写首次创建时的密码；不记得请选重新创建容器（或清空 /opt/oci-worker/data/mysql 后重装）。"
+                die "MySQL has started, but the username or password is incorrect. When reusing a container, enter the password used at initial creation. If you do not remember it, recreate the container or clear /opt/oci-worker/data/mysql and reinstall."
                 ;;
             *)
                 consecutive=0
@@ -412,31 +412,31 @@ wait_docker_mysql_user() {
 }
 
 verify_docker_mysql_credentials() {
-    info "验证数据库账号..."
+    info "Verifying database credentials..."
     local probe
     probe="$(probe_database)"
     case "${probe}" in
         ok)
-            ok "登录成功"
+            ok "Login succeeded"
             ;;
         auth_fail)
-            die "无法用当前用户名/密码连接容器内 MySQL（密码须与容器初始化时一致，或选择重新创建容器）"
+            die "Unable to connect to MySQL inside the container with the current username/password. The password must match the container initialization value, or you must recreate the container."
             ;;
         conn_fail)
-            die "无法连接 127.0.0.1:3306，请检查容器：docker logs oci-worker-mysql"
+            die "Unable to connect to 127.0.0.1:3306. Check the container: docker logs oci-worker-mysql"
             ;;
         *)
-            die "MySQL 返回错误：${probe#other:}"
+            die "MySQL returned an error: ${probe#other:}"
             ;;
     esac
-    check_database_quality || die "数据库自检未通过"
+    check_database_quality || die "Database self-check failed"
 }
 
 ensure_mysql_client() {
     if command -v mysql >/dev/null 2>&1; then
         return 0
     fi
-    info "安装 MySQL 客户端（用于数据库自检）..."
+    info "Installing MySQL client for database self-checks..."
     local pm="$(detect_pkg_mgr)"
     case "${pm}" in
         apt)
@@ -450,7 +450,7 @@ ensure_mysql_client() {
             ${pm} install -y -q mysql || ${pm} install -y -q mariadb
             ;;
         *)
-            warn "无法自动安装 mysql 客户端，将跳过数据库自检（可能踩坑）"
+            warn "Unable to install the mysql client automatically. Database self-checks will be skipped, which may hide setup issues."
             ;;
     esac
 }
@@ -488,40 +488,40 @@ check_database_quality() {
     # Version check
     out="$(mysql_cli_run "${DB_HOST}" "${DB_PORT}" "${DB_USER}" "${DB_PASS}" "" "SELECT VERSION();")"
     if [ -z "${out}" ]; then
-        err "无法获取 MySQL 版本：${out}"
+        err "Unable to get MySQL version: ${out}"
         return 1
     fi
     local ver_line ver_major
     ver_line="$(echo "${out}" | grep -Eo '[0-9]+(\.[0-9]+)+' | head -1)"
     ver_major="${ver_line%%.*}"
     if [ -z "${ver_major}" ] || [ "${ver_major}" -lt 8 ]; then
-        err "MySQL 版本过低：${out}（需要 8.0+）"
-        warn "请在面板/服务器升级到 MySQL 8.0 或更高版本"
+        err "MySQL version is too old: ${out} (8.0+ is required)"
+        warn "Upgrade MySQL to 8.0 or later in your panel or server."
         return 1
     fi
-    ok "MySQL 版本：${ver_line:-${out}}"
+    ok "MySQL version: ${ver_line:-${out}}"
 
     # Database existence
     out="$(mysql_cli_run "${DB_HOST}" "${DB_PORT}" "${DB_USER}" "${DB_PASS}" "" \
             "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';")"
     if [ "${out}" != "${DB_NAME}" ]; then
-        warn "数据库 \`${DB_NAME}\` 不存在或当前用户无权访问"
-        if [ "$(ask_yes_no "尝试用当前账号自动创建数据库（utf8mb4）？" "Y")" = "y" ]; then
+        warn "Database \`${DB_NAME}\` does not exist or the current user cannot access it."
+        if [ "$(ask_yes_no "Try to create the database automatically with the current account (utf8mb4)?" "Y")" = "y" ]; then
             local create_out
             create_out="$(mysql_cli_run "${DB_HOST}" "${DB_PORT}" "${DB_USER}" "${DB_PASS}" "" \
                 "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")"
             if [ -n "${create_out}" ]; then
-                err "自动创建失败：${create_out}"
-                warn "请在面板里手动创建数据库 ${DB_NAME}（字符集 utf8mb4），并授权给用户 ${DB_USER}"
+                err "Automatic creation failed: ${create_out}"
+                warn "Create database ${DB_NAME} manually in the panel with utf8mb4 charset, then grant access to user ${DB_USER}."
                 return 1
             fi
-            ok "已创建数据库 ${DB_NAME}"
+            ok "Created database ${DB_NAME}"
         else
-            warn "请在面板里建库后重试"
+            warn "Create the database in the panel and retry."
             return 1
         fi
     else
-        ok "数据库 ${DB_NAME} 已存在"
+        ok "Database ${DB_NAME} exists"
     fi
 
     # Charset check (after DB exists)
@@ -529,22 +529,22 @@ check_database_quality() {
         "SELECT DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';")"
     case "${out}" in
         utf8mb4)
-            ok "字符集：utf8mb4"
+            ok "Charset: utf8mb4"
             ;;
         "")
-            warn "无法读取字符集信息（可能权限不足），跳过此项"
+            warn "Unable to read charset information, possibly due to insufficient permissions. Skipping this check."
             ;;
         *)
-            warn "字符集为 ${out}，建议改为 utf8mb4 以避免存储 emoji/特殊字符出错"
-            if [ "$(ask_yes_no "尝试自动 ALTER DATABASE 修复字符集？" "Y")" = "y" ]; then
+            warn "Charset is ${out}. Change it to utf8mb4 to avoid errors when storing emoji or special characters."
+            if [ "$(ask_yes_no "Try to fix the charset automatically with ALTER DATABASE?" "Y")" = "y" ]; then
                 local alter_out
                 alter_out="$(mysql_cli_run "${DB_HOST}" "${DB_PORT}" "${DB_USER}" "${DB_PASS}" "" \
                     "ALTER DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")"
                 if [ -n "${alter_out}" ]; then
-                    warn "ALTER 失败（可能权限不足）：${alter_out}"
-                    warn "请在面板里把库 ${DB_NAME} 改成 utf8mb4 后重试"
+                    warn "ALTER failed, possibly due to insufficient permissions: ${alter_out}"
+                    warn "Change database ${DB_NAME} to utf8mb4 in the panel and retry."
                 else
-                    ok "已修复字符集"
+                    ok "Charset fixed"
                 fi
             fi
             ;;
@@ -554,92 +554,92 @@ check_database_quality() {
     out="$(mysql_cli_run "${DB_HOST}" "${DB_PORT}" "${DB_USER}" "${DB_PASS}" "${DB_NAME}" \
         "CREATE TABLE IF NOT EXISTS _ociworker_probe_(id INT) ENGINE=InnoDB; DROP TABLE _ociworker_probe_;")"
     if [ -n "${out}" ]; then
-        err "DDL 权限测试失败：${out}"
-        warn "请确认用户 ${DB_USER} 对库 ${DB_NAME} 拥有所有权限"
+        err "DDL privilege test failed: ${out}"
+        warn "Confirm that user ${DB_USER} has all privileges on database ${DB_NAME}."
         return 1
     fi
-    ok "DDL 权限：通过"
+    ok "DDL privileges: passed"
     return 0
 }
 
 prompt_db_existing() {
     # User picks existing MySQL (1Panel / Aapanel / pre-installed).
-    section "数据库连接配置"
+    section "Database Connection Configuration"
     cat >&2 <<EOF
-请确保已在面板里准备好：
-  1. 数据库（默认建议名：oci_worker）
-  2. 用户（默认建议名：oci_worker）
-  3. 字符集 utf8mb4 / utf8mb4_unicode_ci
-  4. 用户对该库有所有权限
-  5. MySQL 监听端口已暴露到宿主机（127.0.0.1:3306 通常即可）
+Make sure the following are ready in your panel:
+  1. Database (recommended default name: oci_worker)
+  2. User (recommended default name: oci_worker)
+  3. Charset utf8mb4 / utf8mb4_unicode_ci
+  4. The user has all privileges on this database
+  5. The MySQL listening port is exposed to the host (127.0.0.1:3306 is usually enough)
 
 EOF
     while true; do
-        DB_HOST="$(ask "数据库地址" "127.0.0.1")"
-        DB_PORT="$(ask "数据库端口" "3306")"
-        DB_NAME="$(ask "数据库名"   "oci_worker")"
-        DB_USER="$(ask "用户名"     "oci_worker")"
-        DB_PASS="$(ask_password "密码")"
+        DB_HOST="$(ask "Database host" "127.0.0.1")"
+        DB_PORT="$(ask "Database port" "3306")"
+        DB_NAME="$(ask "Database name" "oci_worker")"
+        DB_USER="$(ask "Username"      "oci_worker")"
+        DB_PASS="$(ask_password "Password")"
 
         if [ -z "${DB_PASS}" ]; then
-            warn "密码不能为空"
+            warn "Password cannot be empty"
             continue
         fi
 
-        info "测试网络连通性 ${DB_HOST}:${DB_PORT}..."
+        info "Testing network connectivity to ${DB_HOST}:${DB_PORT}..."
         if command -v nc >/dev/null 2>&1; then
             if ! nc -z -w 5 "${DB_HOST}" "${DB_PORT}" 2>/dev/null; then
-                err "无法连接 ${DB_HOST}:${DB_PORT}"
+                err "Unable to connect to ${DB_HOST}:${DB_PORT}"
                 cat >&2 <<'EOT'
-可能原因（按概率排序）：
-  1. 面板中 MySQL 容器/服务未启动，或端口未映射到宿主机
-  2. 端口不是默认 3306（请在面板查看实际端口）
-  3. 防火墙拦截（127.0.0.1 通常不会，远程地址需放行）
+Possible causes, roughly in order of likelihood:
+  1. The MySQL container/service in the panel is not running, or the port is not mapped to the host
+  2. The port is not the default 3306; check the actual port in the panel
+  3. A firewall is blocking access; 127.0.0.1 usually is not blocked, but remote addresses need allow rules
 EOT
-                if [ "$(ask_yes_no "重新输入连接信息？" "Y")" = "y" ]; then continue; fi
+                if [ "$(ask_yes_no "Re-enter connection information?" "Y")" = "y" ]; then continue; fi
                 return 1
             fi
-            ok "网络连通"
+            ok "Network is reachable"
         else
-            warn "未安装 nc，跳过端口探测"
+            warn "nc is not installed. Skipping port probing."
         fi
 
-        info "测试登录..."
+        info "Testing login..."
         local probe; probe="$(probe_database)"
         case "${probe}" in
             ok)
-                ok "登录成功"
+                ok "Login succeeded"
                 ;;
             auth_fail)
-                err "登录失败：用户名或密码错误，或 host 限制"
+                err "Login failed: username/password is incorrect, or host access is restricted."
                 cat >&2 <<EOT
-常见原因：
-  * 用户在面板里设置了"本地服务器(localhost)"权限，但脚本用 127.0.0.1 连接，
-    MySQL 把 localhost(unix socket) 与 127.0.0.1(TCP) 当作不同 host 处理。
-    解决：在面板里把用户的访问权限改为"所有人(%)"，或加一条 127.0.0.1。
-  * 密码记错了。
+Common causes:
+  * The panel set this user to "local server (localhost)" access, but the script connects through 127.0.0.1.
+    MySQL treats localhost (Unix socket) and 127.0.0.1 (TCP) as different hosts.
+    Fix: change the user's access scope in the panel to "everyone (%)", or add 127.0.0.1.
+  * The password is wrong.
 EOT
-                if [ "$(ask_yes_no "重新输入连接信息？" "Y")" = "y" ]; then continue; fi
+                if [ "$(ask_yes_no "Re-enter connection information?" "Y")" = "y" ]; then continue; fi
                 return 1
                 ;;
             conn_fail)
-                err "无法建立连接，请检查 MySQL 服务/端口"
-                if [ "$(ask_yes_no "重新输入连接信息？" "Y")" = "y" ]; then continue; fi
+                err "Unable to connect. Check the MySQL service and port."
+                if [ "$(ask_yes_no "Re-enter connection information?" "Y")" = "y" ]; then continue; fi
                 return 1
                 ;;
             other:*)
-                err "MySQL 返回错误：${probe#other:}"
-                if [ "$(ask_yes_no "重新输入连接信息？" "Y")" = "y" ]; then continue; fi
+                err "MySQL returned an error: ${probe#other:}"
+                if [ "$(ask_yes_no "Re-enter connection information?" "Y")" = "y" ]; then continue; fi
                 return 1
                 ;;
         esac
 
         if check_database_quality; then
-            ok "数据库自检全部通过"
+            ok "All database self-checks passed"
             return 0
         fi
 
-        if [ "$(ask_yes_no "数据库自检未通过，重新输入？" "Y")" = "y" ]; then
+        if [ "$(ask_yes_no "Database self-check failed. Re-enter information?" "Y")" = "y" ]; then
             continue
         fi
         return 1
@@ -648,44 +648,44 @@ EOT
 
 prompt_db_docker() {
     # Spin up an isolated MySQL 8.0 in Docker.
-    section "Docker MySQL 自动安装"
+    section "Docker MySQL Automatic Installation"
     if ! command -v docker >/dev/null 2>&1; then
-        info "未检测到 Docker，正在安装..."
-        curl -fsSL https://get.docker.com | sh || die "Docker 安装失败"
+        info "Docker was not detected. Installing..."
+        curl -fsSL https://get.docker.com | sh || die "Docker installation failed"
     fi
     DB_HOST="127.0.0.1"
     DB_PORT="3306"
-    DB_NAME="$(ask "数据库名"   "oci_worker")"
-    DB_USER="$(ask "用户名"     "oci_worker")"
-    DB_PASS="$(ask_password "新建用户密码（至少 8 位，建议含字母数字）")"
+    DB_NAME="$(ask "Database name" "oci_worker")"
+    DB_USER="$(ask "Username"      "oci_worker")"
+    DB_PASS="$(ask_password "New user password (at least 8 characters; letters and numbers recommended)")"
     while [ "${#DB_PASS}" -lt 6 ]; do
-        warn "密码太短"
-        DB_PASS="$(ask_password "新建用户密码")"
+        warn "Password is too short"
+        DB_PASS="$(ask_password "New user password")"
     done
     local root_pass
-    root_pass="$(ask_password "root 密码（用于初始化，可与上方相同）")"
+    root_pass="$(ask_password "root password (used for initialization; can match the password above)")"
     [ -n "${root_pass}" ] || root_pass="${DB_PASS}"
 
     if docker ps -a --format '{{.Names}}' | grep -qx "oci-worker-mysql"; then
-        warn "已存在容器 oci-worker-mysql"
-        if [ "$(ask_yes_no "重新创建？（会保留 /opt/oci-worker/data/mysql 数据目录）" "N")" = "y" ]; then
+        warn "Container oci-worker-mysql already exists"
+        if [ "$(ask_yes_no "Recreate it? The /opt/oci-worker/data/mysql data directory will be kept." "N")" = "y" ]; then
             docker rm -f oci-worker-mysql >/dev/null
         else
-            info "复用已有容器"
+            info "Reusing existing container"
         fi
     fi
 
     if docker ps -a --format '{{.Names}}' | grep -qx "oci-worker-mysql"; then
         if ! docker ps --format '{{.Names}}' | grep -qx "oci-worker-mysql"; then
-            info "启动已有容器 oci-worker-mysql..."
-            docker start oci-worker-mysql >/dev/null || die "启动容器失败：docker start oci-worker-mysql"
-            wait_docker_mysql_user || die "MySQL 启动超时，请查看：docker logs oci-worker-mysql"
+            info "Starting existing container oci-worker-mysql..."
+            docker start oci-worker-mysql >/dev/null || die "Failed to start container: docker start oci-worker-mysql"
+            wait_docker_mysql_user || die "MySQL startup timed out. Check: docker logs oci-worker-mysql"
         fi
         verify_docker_mysql_credentials
         return 0
     fi
 
-    info "启动 MySQL 8.0 容器..."
+    info "Starting MySQL 8.0 container..."
     mkdir -p /opt/oci-worker/data/mysql
     docker run -d \
         --name oci-worker-mysql \
@@ -700,38 +700,38 @@ prompt_db_docker() {
         mysql:8.0 \
         --character-set-server=utf8mb4 \
         --collation-server=utf8mb4_unicode_ci >/dev/null \
-        || die "MySQL 容器启动失败"
-    wait_docker_mysql_user || die "MySQL 启动超时，请查看：docker logs oci-worker-mysql"
+        || die "Failed to start MySQL container"
+    wait_docker_mysql_user || die "MySQL startup timed out. Check: docker logs oci-worker-mysql"
     verify_docker_mysql_credentials
 }
 
 prompt_db_root() {
     # User has MySQL root, let us auto-create db + user.
-    section "用 root 自动创建数据库和用户"
-    DB_HOST="$(ask "数据库地址" "127.0.0.1")"
-    DB_PORT="$(ask "数据库端口" "3306")"
+    section "Automatically Create Database and User with root"
+    DB_HOST="$(ask "Database host" "127.0.0.1")"
+    DB_PORT="$(ask "Database port" "3306")"
     local root_user root_pass
-    root_user="$(ask "root 用户名" "root")"
-    root_pass="$(ask_password "root 密码")"
+    root_user="$(ask "root username" "root")"
+    root_pass="$(ask_password "root password")"
 
-    DB_NAME="$(ask "新建数据库名" "oci_worker")"
-    DB_USER="$(ask "新建用户名"   "oci_worker")"
-    DB_PASS="$(ask_password "新建用户密码")"
+    DB_NAME="$(ask "New database name" "oci_worker")"
+    DB_USER="$(ask "New username"      "oci_worker")"
+    DB_PASS="$(ask_password "New user password")"
     while [ "${#DB_PASS}" -lt 6 ]; do
-        warn "密码太短"
-        DB_PASS="$(ask_password "新建用户密码")"
+        warn "Password is too short"
+        DB_PASS="$(ask_password "New user password")"
     done
 
-    info "用 root 测试连接..."
+    info "Testing connection with root..."
     local probe_out
     if mysql_select1_ok "${DB_HOST}" "${DB_PORT}" "${root_user}" "${root_pass}"; then
-        ok "root 登录成功"
+        ok "root login succeeded"
     else
         probe_out="$(mysql_cli_run "${DB_HOST}" "${DB_PORT}" "${root_user}" "${root_pass}" "" "SELECT 1")"
-        die "root 登录失败：${probe_out}"
+        die "root login failed: ${probe_out}"
     fi
 
-    info "创建数据库和用户..."
+    info "Creating database and user..."
     local db_ident user_lit pass_lit sql_file
     db_ident="$(sql_escape_ident "${DB_NAME}")"
     user_lit="$(sql_escape_literal "${DB_USER}")"
@@ -754,61 +754,63 @@ EOF
             < "${sql_file}" 2>"${errf}"; then
         create_out="$(cat "${errf}")"
         rm -f "${sql_file}" "${errf}"
-        die "创建数据库/用户失败：${create_out}"
+        die "Failed to create database/user: ${create_out}"
     fi
     rm -f "${errf}"
     rm -f "${sql_file}"
-    ok "数据库 ${DB_NAME} 和用户 ${DB_USER} 已创建"
+    ok "Database ${DB_NAME} and user ${DB_USER} created"
 
     if ! check_database_quality; then
-        die "数据库自检未通过"
+        die "Database self-check failed"
     fi
 }
 
 run_db_wizard() {
-    section "数据库配置"
+    section "Database Configuration"
     local choice
-    choice="$(ask_choice "请选择数据库使用方式：" 1 \
-        "我已经有 MySQL（1Panel/宝塔/已安装的服务），手动填写连接信息" \
-        "我没有数据库，让脚本用 Docker 帮我装一个独立 MySQL 8.0" \
-        "我有 MySQL root 账号，让脚本帮我自动建库建用户")"
+    choice="$(ask_choice "Choose how to use MySQL:" 1 \
+        "I already have MySQL (1Panel/Aapanel/pre-installed service); enter connection details manually" \
+        "I do not have a database; let the script install an isolated MySQL 8.0 with Docker" \
+        "I have a MySQL root account; let the script create the database and user")"
     ensure_mysql_client
     case "${choice}" in
-        1) prompt_db_existing || die "数据库配置未完成，已退出安装。修复连接问题后可重跑 install.sh" ;;
-        2) prompt_db_docker   || die "Docker MySQL 安装失败，请查看上方错误信息" ;;
-        3) prompt_db_root     || die "用 root 自动建库失败，请查看上方错误信息" ;;
+        1) prompt_db_existing || die "Database configuration was not completed. Installation exited. Fix the connection issue and rerun install.sh." ;;
+        2) prompt_db_docker   || die "Docker MySQL installation failed. Check the error above." ;;
+        3) prompt_db_root     || die "Automatic database creation with root failed. Check the error above." ;;
     esac
 }
 
 # -----------------------------------------------------------------------------
 # Web settings
 # -----------------------------------------------------------------------------
-# 说明：管理员账号/密码不在脚本里设置。
-# 后端 isSetupDone() 只看数据库 oci_kv 表里有没有记录，与 application.yml
-# 里的 web.account / web.password 无关——yml 里的两个值只在数据库被清空、
-# 用户尚未在浏览器完成 Setup 之前作为兜底默认值存在。
-# 因此脚本只需要：
-#   1. 收集 Web 端口
-#   2. 在 yml 里塞一个占位账号 admin + 随机密码（用户永远不会用到）
-#   3. 部署完成后引导用户去 http://ip:port 完成首次设置
+# Administrator account/password are not set in this script.
+# The backend isSetupDone() check only looks for records in the oci_kv table.
+# It does not use web.account / web.password from application.yml. Those YAML
+# values are fallback defaults only when the database has been cleared and the
+# user has not completed Setup in the browser yet.
+# Therefore, this script only needs to:
+#   1. Collect the web port
+#   2. Write a placeholder admin account and random password to YAML
+#   3. Guide the user to http://ip:port for first-time setup after deployment
 WEB_PORT=""
 WEB_DEFAULT_ACCOUNT="admin"
 WEB_DEFAULT_PASSWORD=""
 prompt_web() {
-    section "Web 服务配置"
+    section "Web Service Configuration"
     while true; do
-        WEB_PORT="$(ask "OCI Worker Web 端口" "8818")"
+        WEB_PORT="$(ask "OCI Worker Web port" "8818")"
         if [[ "${WEB_PORT}" =~ ^[0-9]+$ ]] && [ "${WEB_PORT}" -ge 1 ] && [ "${WEB_PORT}" -le 65535 ]; then
             if [ "${WEB_PORT}" -eq 8008 ]; then
-                warn "端口 8008 不可用，请换一个"
+                warn "Port 8008 is unavailable. Choose another port."
                 continue
             fi
             break
         fi
-        warn "端口无效"
+        warn "Invalid port"
     done
 
-    # 32 字节随机十六进制（仅作为 yml 里的占位值，用户实际登录走浏览器 Setup 流程）
+    # 32 random hex bytes. This is only a YAML placeholder; actual login is
+    # configured through the browser Setup flow.
     if command -v openssl >/dev/null 2>&1; then
         WEB_DEFAULT_PASSWORD="$(openssl rand -hex 16)"
     else
@@ -817,9 +819,10 @@ prompt_web() {
 
     cat >&2 <<EOF
 
-[i] 管理员账号和密码不在 SSH 里设置，等服务起来后请到浏览器完成首次设置：
+[i] The administrator account and password are not set in SSH. After the
+    service starts, complete first-time setup in your browser:
        http://<your-ip>:${WEB_PORT}
-    （后端将在数据库里安全存储 sha256 哈希后的密码）
+    The backend stores the password securely in the database as a sha256 hash.
 
 EOF
 }
@@ -837,7 +840,7 @@ yaml_escape() {
 }
 
 write_application_yml() {
-    info "生成 application.yml..."
+    info "Generating application.yml..."
     mkdir -p "${INSTALL_DIR}" "${KEYS_DIR}" "${BACKUP_DIR}"
 
     if [ -f "${CONFIG_FILE}" ]; then
@@ -852,8 +855,9 @@ server:
   port: ${WEB_PORT}
 
 web:
-  # 仅作为兜底默认值；真实管理员账号/密码请在首次访问 Web 时设置。
-  # 设置后会以 sha256 哈希存入数据库 oci_kv 表，与此处无关。
+  # Fallback defaults only. Set the real administrator account/password on first
+  # web access. After setup, the password is stored as a sha256 hash in the
+  # oci_kv database table and is unrelated to this file.
   account: "$(yaml_escape "${WEB_DEFAULT_ACCOUNT}")"
   password: "$(yaml_escape "${WEB_DEFAULT_PASSWORD}")"
 
@@ -884,11 +888,11 @@ oci-cfg:
   key-dir-path: ./keys
 EOF
     chmod 600 "${CONFIG_FILE}"
-    ok "配置文件已写入：${CONFIG_FILE}"
+    ok "Configuration file written: ${CONFIG_FILE}"
 }
 
 write_systemd_unit() {
-    info "写入 systemd 服务：${SERVICE_NAME}..."
+    info "Writing systemd service: ${SERVICE_NAME}..."
     cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=OCI Worker
@@ -900,7 +904,8 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=/usr/local/bin/java -Xmx256m -Duser.timezone=Asia/Shanghai -Duser.dir=${INSTALL_DIR} -jar ${JAR_NAME} --spring.config.additional-location=file:${CONFIG_FILE}
 Restart=on-failure
 RestartSec=10
-# 未设置时 systemd 常用默认约 90s，stop 期间脚本长时间无新日志，易被误认为卡死
+# Without this, systemd commonly defaults to about 90s. During stop, the script
+# may show no new logs for a while and look stuck.
 TimeoutStopSec=45
 
 [Install]
@@ -908,10 +913,11 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-    ok "systemd 服务已注册"
+    ok "systemd service registered"
 }
 
-# 已部署环境可能仍为旧版 unit（无 TimeoutStopSec），升级时 stop 会等满 systemd 默认超时（常见 ~90s）
+# Existing deployments may still use an old unit without TimeoutStopSec. During
+# upgrades, stop can wait for the full systemd default timeout, commonly ~90s.
 apply_worker_stop_timeout_dropin() {
     mkdir -p "/etc/systemd/system/${SERVICE_NAME}.service.d"
     cat > "/etc/systemd/system/${SERVICE_NAME}.service.d/10-stop-timeout.conf" <<'EOF'
@@ -927,7 +933,7 @@ EOF
 download_with_retry() {
     # download_with_retry <url> <dest>
     local url="$1" dest="$2"
-    info "下载: ${url}"
+    info "Downloading: ${url}"
     if ! curl -fSL --retry 3 --retry-delay 5 --connect-timeout 15 -o "${dest}" "${url}"; then
         return 1
     fi
@@ -940,7 +946,7 @@ file_size() {
 # Returns 0 on success, non-zero on failure. NEVER calls die() so callers
 # can decide whether to roll back.
 download_jar() {
-    info "下载 JAR（Release：${JAR_RELEASE_TAG}）…"
+    info "Downloading JAR (release: ${JAR_RELEASE_TAG})..."
     local url tmp size attempt max
     url="https://github.com/${REPO}/releases/download/${JAR_RELEASE_TAG}/${JAR_ASSET}"
     tmp="${INSTALL_DIR}/${JAR_NAME}.tmp"
@@ -953,29 +959,29 @@ download_jar() {
         rm -f "${tmp}"
         attempt=$((attempt+1))
         if [ "${attempt}" -ge "${max}" ]; then
-            err "JAR 下载失败"
-            err "若出现 404，多为刚推送代码、或 GitHub Release 正更新，请过几分钟再试，并在仓库 Releases 页确认「${JAR_RELEASE_TAG}」下已有 ${JAR_ASSET}。"
+            err "JAR download failed"
+            err "If you see a 404, the code may have just been pushed or the GitHub Release may still be updating. Wait a few minutes and confirm that ${JAR_ASSET} exists under release ${JAR_RELEASE_TAG}."
             return 1
         fi
-        warn "JAR 下载失败，20 秒后重试（第 ${attempt}/${max} 次，常见于 GitHub 刚更新时）"
+        warn "JAR download failed. Retrying in 20 seconds (${attempt}/${max}); this is common right after GitHub updates."
         sleep 20
     done
     size="$(file_size "${tmp}")"
     if [ "${size}" -lt 1000000 ]; then
         rm -f "${tmp}"
-        err "下载的 JAR 文件大小异常（${size} 字节），可能是 404 页面"
+        err "Downloaded JAR size looks abnormal (${size} bytes); this may be a 404 page."
         return 1
     fi
     # Quick sanity: must be a valid ZIP/JAR
     if command -v unzip >/dev/null 2>&1; then
         if ! unzip -tq "${tmp}" >/dev/null 2>&1; then
             rm -f "${tmp}"
-            err "下载的 JAR 损坏，请重试"
+            err "Downloaded JAR is corrupt. Please retry."
             return 1
         fi
     fi
     mv "${tmp}" "${INSTALL_DIR}/${JAR_NAME}"
-    ok "JAR 已就绪：$(numfmt --to=iec "${size}" 2>/dev/null || echo "${size} 字节")"
+    ok "JAR is ready: $(numfmt --to=iec "${size}" 2>/dev/null || echo "${size} bytes")"
     return 0
 }
 
@@ -983,17 +989,17 @@ download_jar() {
 # Install / restart with rollback
 # -----------------------------------------------------------------------------
 restart_with_rollback() {
-    info "启动 ${SERVICE_NAME}..."
+    info "Starting ${SERVICE_NAME}..."
     if ! systemctl restart "${SERVICE_NAME}"; then
-        warn "服务启动失败，尝试回滚配置..."
+        warn "Service startup failed. Trying to roll back configuration..."
         local last_bak
         last_bak="$(ls -1t "${CONFIG_FILE}.bak."* 2>/dev/null | head -n 1 || true)"
         if [ -n "${last_bak}" ]; then
             cp -p "${last_bak}" "${CONFIG_FILE}"
             systemctl restart "${SERVICE_NAME}" || true
-            warn "已回滚到上一个配置：${last_bak}"
+            warn "Rolled back to previous configuration: ${last_bak}"
         fi
-        err "请查看日志：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+        err "Check logs: journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
         return 1
     fi
 
@@ -1002,11 +1008,11 @@ restart_with_rollback() {
     for i in 1 2 3 4 5; do
         sleep 2
         if systemctl is-active --quiet "${SERVICE_NAME}"; then
-            ok "${SERVICE_NAME} 已运行"
+            ok "${SERVICE_NAME} is running"
             return 0
         fi
     done
-    warn "${SERVICE_NAME} 启动状态未稳定，请用 journalctl 查看"
+    warn "${SERVICE_NAME} startup status is not stable yet. Check with journalctl."
     return 1
 }
 
@@ -1017,11 +1023,11 @@ firewall_open_port() {
     local port="$1"
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "${port}/tcp" >/dev/null 2>&1 || true
-        info "ufw 已放行 ${port}/tcp"
+        info "ufw allowed ${port}/tcp"
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
-        info "firewalld 已放行 ${port}/tcp"
+        info "firewalld allowed ${port}/tcp"
     fi
 }
 
@@ -1038,9 +1044,9 @@ cleanup_legacy_webssh() {
 }
 
 security_notice() {
-    section "安全提醒"
+    section "Security Notice"
     cat >&2 <<EOF
-* 推荐：用 Nginx 反向代理 + HTTPS（Let's Encrypt）保护 ${WEB_PORT}。
+* Recommended: protect port ${WEB_PORT} with an Nginx reverse proxy and HTTPS (Let's Encrypt).
 EOF
 }
 
@@ -1059,40 +1065,40 @@ install_ociworker_cli() {
         src="${self_dir}/ociworker"
     fi
     if [ -z "${src}" ]; then
-        info "下载管理脚本 ociworker（优先 master 分支）..."
+        info "Downloading ociworker management script (main branch first)..."
         local tmp="${TMP_DIR}/ociworker"
         if download_with_retry "${RAW_BASE}/ociworker" "${tmp}"; then
             src="${tmp}"
         elif download_with_retry "https://github.com/${REPO}/releases/download/${INSTALLER_RELEASE_TAG}/ociworker" "${tmp}"; then
             src="${tmp}"
         else
-            warn "无法下载 ociworker（不影响主程序运行），可稍后手动安装"
+            warn "Unable to download ociworker. The main application can still run; you can install it manually later."
             return 0
         fi
     fi
     install -m 0755 "${src}" "${OCIWORKER_BIN}"
     # python3 is required by `ociworker config` for safe YAML editing.
     if ! command -v python3 >/dev/null 2>&1; then
-        info "安装 python3（被 ociworker config 子命令使用）..."
-        pkg_install python3 || warn "python3 未能自动安装，ociworker config 子命令将不可用"
+        info "Installing python3, required by the ociworker config subcommand..."
+        pkg_install python3 || warn "python3 could not be installed automatically; the ociworker config subcommand will be unavailable."
     fi
-    ok "管理脚本已安装：${OCIWORKER_BIN}（敲 \`ociworker\` 进菜单）"
+    ok "Management script installed: ${OCIWORKER_BIN} (run \`ociworker\` for the menu)"
 }
 
 # =============================================================================
 # Main entry points
 # =============================================================================
 do_install() {
-    section "OCI Worker 智能安装向导"
-    info "系统架构：$(uname -m) (映射为 ${ARCH})"
+    section "OCI Worker Smart Installation Wizard"
+    info "System architecture: $(uname -m) (mapped to ${ARCH})"
     install_jdk21
 
     run_db_wizard
     prompt_web
 
-    section "下载与部署"
+    section "Download and Deploy"
     mkdir -p "${INSTALL_DIR}" "${KEYS_DIR}" "${BACKUP_DIR}"
-    download_jar || die "JAR 下载失败，无法继续安装"
+    download_jar || die "JAR download failed. Cannot continue installation."
     write_application_yml
     write_systemd_unit
 
@@ -1102,45 +1108,45 @@ do_install() {
     install_ociworker_cli
 
     if ! restart_with_rollback; then
-        die "OCI Worker 启动失败，已尝试回滚。请查看日志后再决定是否重试。"
+        die "OCI Worker failed to start. Rollback was attempted. Check logs before deciding whether to retry."
     fi
 
     security_notice
 
     local pub_ip
     pub_ip="$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "<your-server-ip>")"
-    section "部署完成"
+    section "Deployment Complete"
     cat >&2 <<EOF
-访问地址:    http://${pub_ip}:${WEB_PORT}
+Access URL:    http://${pub_ip}:${WEB_PORT}
 
-下一步（必做）：
-  1. 在浏览器打开上面的访问地址
-  2. 按页面提示设置管理员账号和密码（密码至少 6 位）
-  3. 设置完即可登录使用
+Next steps (required):
+  1. Open the access URL above in your browser
+  2. Follow the page prompts to set the administrator account and password (password must be at least 6 characters)
+  3. Log in after setup is complete
 
-防火墙提醒：
-  * 已自动放行本机 ufw / firewalld 的 ${WEB_PORT}/tcp
-  * 云厂商安全组里也要放行 ${WEB_PORT}/tcp（OCI/AWS/腾讯云等）
-常用管理命令（敲 ociworker 进交互菜单）：
-  ociworker status     查看状态
-  ociworker logs       查看实时日志
-  ociworker config     修改端口/数据库（含回滚；账号密码请在网页修改）
-  ociworker update     更新到最新版本
-  ociworker backup     备份数据库 + 配置 + 密钥
-  ociworker tg-clean   清除 Telegram 绑定（无本机 mysql 时自动经 Docker MySQL 容器）
+Firewall reminder:
+  * Local ufw / firewalld has automatically allowed ${WEB_PORT}/tcp
+  * Also allow ${WEB_PORT}/tcp in your cloud security group (OCI/AWS/Tencent Cloud, etc.)
+Common management commands (run ociworker for the interactive menu):
+  ociworker status     Show status
+  ociworker logs       Show live logs
+  ociworker config     Change port/database with rollback; change account/password in the web UI
+  ociworker update     Update to the latest version
+  ociworker backup     Back up database, configuration, and keys
+  ociworker tg-clean   Clear Telegram binding; uses Docker MySQL automatically if host mysql is missing
 EOF
 }
 
 do_upgrade() {
-    section "OCI Worker 升级模式"
-    info "检测到已有安装：${INSTALL_DIR}"
-    info "升级模式不会修改 application.yml 和数据库"
+    section "OCI Worker Upgrade Mode"
+    info "Existing installation detected: ${INSTALL_DIR}"
+    info "Upgrade mode will not modify application.yml or the database"
 
     install_jdk21
 
     apply_worker_stop_timeout_dropin
 
-    info "停止 ${SERVICE_NAME}..."
+    info "Stopping ${SERVICE_NAME}..."
     systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
 
     # Backup current JAR before replacing
@@ -1149,10 +1155,10 @@ do_upgrade() {
     fi
 
     if ! download_jar; then
-        warn "JAR 下载失败，恢复旧版本"
+        warn "JAR download failed. Restoring old version."
         [ -f "${INSTALL_DIR}/${JAR_NAME}.bak" ] && mv "${INSTALL_DIR}/${JAR_NAME}.bak" "${INSTALL_DIR}/${JAR_NAME}"
         systemctl start "${SERVICE_NAME}" || true
-        die "升级失败"
+        die "Upgrade failed"
     fi
 
     cleanup_legacy_webssh
@@ -1162,26 +1168,26 @@ do_upgrade() {
     if restart_with_rollback; then
         # On success, drop the JAR backup
         rm -f "${INSTALL_DIR}/${JAR_NAME}.bak"
-        ok "升级完成"
+        ok "Upgrade completed"
         local cur_port
         cur_port="$(awk '/^server:/{f=1;next} f && /^[^ ]/{f=0} f && /port:/{print $2; exit}' "${CONFIG_FILE}" 2>/dev/null | tr -d '"'\''' || true)"
         cur_port="${cur_port:-8818}"
         local pub_ip
         pub_ip="$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "<your-server-ip>")"
-        section "升级完成"
+        section "Upgrade Complete"
         cat >&2 <<EOF
-访问地址:    http://${pub_ip}:${cur_port}
-查看日志:    journalctl -u ${SERVICE_NAME} -f
-管理命令:    ociworker
+Access URL:    http://${pub_ip}:${cur_port}
+View logs:     journalctl -u ${SERVICE_NAME} -f
+Management:    ociworker
 EOF
     else
-        warn "新版本启动失败，回滚到旧 JAR..."
+        warn "New version failed to start. Rolling back to the old JAR..."
         if [ -f "${INSTALL_DIR}/${JAR_NAME}.bak" ]; then
             mv "${INSTALL_DIR}/${JAR_NAME}.bak" "${INSTALL_DIR}/${JAR_NAME}"
             systemctl restart "${SERVICE_NAME}" || true
-            warn "已回滚到旧版本"
+            warn "Rolled back to the old version"
         fi
-        die "升级失败，请查看日志"
+        die "Upgrade failed. Check logs."
     fi
 }
 

@@ -1,4 +1,5 @@
-# 构建产物与发布附件体积大，不提交到仓库；通过 GitHub Releases 分发
+# Build artifacts and release attachments are large, so do not commit them.
+# Distribute them through GitHub Releases instead.
 release-assets/
 .build/
 *.jar
