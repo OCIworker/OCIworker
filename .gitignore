@@ -1,0 +1,5 @@
+# 构建产物与发布附件体积大，不提交到仓库；通过 GitHub Releases 分发
+release-assets/
+.build/
+*.jar
+oci-webssh-linux-*
