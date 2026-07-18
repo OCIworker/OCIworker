@@ -10,7 +10,7 @@
 #     connectivity / charset / version / privilege auto-checks.
 #   * Atomic config writes with .bak rollback if the new config breaks startup.
 #
-# This script is INDEPENDENT of the original deploy.sh / update.sh.
+# This script is an independent installer for OCI Worker.
 # It does NOT modify anything outside /opt/oci-worker, /etc/systemd/system,
 # /usr/local/bin/ociworker.
 #
@@ -31,6 +31,7 @@ readonly JAR_ASSET="oci-worker-1.0.0.jar"
 readonly CONFIG_FILE="${INSTALL_DIR}/application.yml"
 readonly SERVICE_NAME="oci-worker"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly WEB_THREAD_DROPIN="/etc/systemd/system/${SERVICE_NAME}.service.d/30-platform-web-threads.conf"
 readonly LEGACY_TERMINAL_BIN="${INSTALL_DIR}/oci-webssh"
 readonly LEGACY_TERMINAL_SERVICE="oci-webssh"
 readonly LEGACY_TERMINAL_CONTAINER="webssh"
@@ -41,10 +42,12 @@ readonly INSTALLER_RELEASE_TAG="installer-latest"
 readonly RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 
 readonly OCIWORKER_BIN="/usr/local/bin/ociworker"
-readonly TMP_DIR="$(mktemp -d -t oci-worker-installer.XXXXXX)"
+TMP_DIR="$(mktemp -d -t oci-worker-installer.XXXXXX)" \
+    || { printf '[ERROR] 无法创建安装器临时目录\n' >&2; exit 1; }
+readonly TMP_DIR
+UPGRADE_LOCK_FALLBACK=""
 
 # JDK 21 (Adoptium Temurin)
-readonly JDK_VERSION="21.0.7+6"
 readonly JDK_VERSION_URLENC="21.0.7%2B6"
 readonly JDK_VERSION_FILE="21.0.7_6"
 readonly JDK_INSTALL_BASE="/opt/java"
@@ -53,6 +56,9 @@ readonly JDK_INSTALL_BASE="/opt/java"
 # Cleanup on exit
 # -----------------------------------------------------------------------------
 cleanup() {
+    if [ -n "${UPGRADE_LOCK_FALLBACK}" ]; then
+        rmdir "${UPGRADE_LOCK_FALLBACK}" 2>/dev/null || true
+    fi
     rm -rf "${TMP_DIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -182,7 +188,8 @@ detect_pkg_mgr() {
 
 # Install a list of packages using whatever PM is available.
 pkg_install() {
-    local pm="$(detect_pkg_mgr)"
+    local pm
+    pm="$(detect_pkg_mgr)"
     case "${pm}" in
         apt) DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
@@ -219,6 +226,9 @@ install_docker_engine_apt_distro() {
 }
 
 docker_official_apt_codename_supported() {
+    # Known Docker APT channels. Unknown codenames use distro docker.io instead.
+    # Debian 11/12/13: bullseye/bookworm/trixie
+    # Ubuntu 20.04/22.04/24.04: focal/jammy/noble
     local repo_os="$1" codename="$2"
     case "${repo_os}:${codename}" in
         debian:bullseye|debian:bookworm|debian:trixie) return 0 ;;
@@ -230,6 +240,7 @@ docker_official_apt_codename_supported() {
 install_docker_engine_apt() {
     local os_id="" os_like="" codename="" repo_os="" arch="" docker_list="/etc/apt/sources.list.d/ociworker-docker.list"
     if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
         . /etc/os-release
         os_id="${ID:-}"
         os_like="${ID_LIKE:-}"
@@ -261,7 +272,7 @@ install_docker_engine_apt() {
     fi
 
     info "使用 Docker 官方 ${repo_os}/${codename} APT 源安装 Docker Engine..."
-    warn "本项目不需要 docker-model-plugin；安装器不会安装该可选包。"
+    warn "本项目不需要 docker-model-plugin；为避免部分 Debian/Ubuntu 找不到该可选包，安装器不会安装它。"
     DEBIAN_FRONTEND=noninteractive apt-get update -qq \
         || warn "apt-get update 失败，将继续尝试安装 Docker 必需依赖"
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl gnupg; then
@@ -283,10 +294,12 @@ install_docker_engine_apt() {
         install_docker_engine_apt_distro
         return $?
     fi
+
     if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
         return 0
     fi
+
     if command -v docker >/dev/null 2>&1; then
         return 0
     fi
@@ -327,6 +340,7 @@ docker_official_rpm_major_supported() {
 install_docker_engine_rpm() {
     local pm="$1" os_id="" os_like="" version_id="" major="" repo_os="" repo_file="/etc/yum.repos.d/ociworker-docker.repo"
     if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
         . /etc/os-release
         os_id="${ID:-}"
         os_like="${ID_LIKE:-}"
@@ -655,7 +669,8 @@ ensure_mysql_client() {
         return 0
     fi
     info "安装 MySQL 客户端（用于数据库自检）..."
-    local pm="$(detect_pkg_mgr)"
+    local pm
+    pm="$(detect_pkg_mgr)"
     case "${pm}" in
         apt)
             DEBIAN_FRONTEND=noninteractive apt-get update -qq
@@ -1075,7 +1090,7 @@ web:
 spring:
   threads:
     virtual:
-      enabled: true
+      enabled: false
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
     url: "$(yaml_escape "${jdbc_url}")"
@@ -1102,7 +1117,23 @@ EOF
     ok "配置文件已写入：${CONFIG_FILE}"
 }
 
+recommended_heap_mb() {
+    local total_kb
+    total_kb="$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [ "${total_kb:-0}" -le 1048576 ]; then
+        echo 256
+    elif [ "${total_kb}" -le 2097152 ]; then
+        echo 384
+    elif [ "${total_kb}" -le 4194304 ]; then
+        echo 512
+    else
+        echo 1024
+    fi
+}
+
 write_systemd_unit() {
+    local heap_mb
+    heap_mb="$(recommended_heap_mb)"
     info "写入 systemd 服务：${SERVICE_NAME}..."
     cat > "${SERVICE_FILE}" <<EOF
 [Unit]
@@ -1112,7 +1143,8 @@ After=network.target docker.service
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=/usr/local/bin/java -Xmx256m -Duser.timezone=Asia/Shanghai -Duser.dir=${INSTALL_DIR} -jar ${JAR_NAME} --spring.config.additional-location=file:${CONFIG_FILE}
+Environment=SPRING_THREADS_VIRTUAL_ENABLED=false
+ExecStart=/usr/local/bin/java -Xmx${heap_mb}m -Duser.timezone=Asia/Shanghai -Duser.dir=${INSTALL_DIR} -jar ${JAR_NAME} --spring.config.additional-location=file:${CONFIG_FILE}
 Restart=on-failure
 RestartSec=10
 # 未设置时 systemd 常用默认约 90s，stop 期间脚本长时间无新日志，易被误认为卡死
@@ -1126,6 +1158,61 @@ EOF
     ok "systemd 服务已注册"
 }
 
+JVM_DROPIN="/etc/systemd/system/${SERVICE_NAME}.service.d/20-managed-jvm-memory.conf"
+JVM_DROPIN_BACKUP=""
+JVM_DROPIN_CREATED=0
+
+apply_managed_jvm_memory_migration() {
+    local heap_mb unit_exec dropin_tmp
+    heap_mb="$(recommended_heap_mb)"
+    unit_exec="$(systemctl show -p ExecStart --value "${SERVICE_NAME}" 2>/dev/null || true)"
+
+    # 只迁移项目历史安装器生成的 -Xmx256m；用户自定义 JVM 参数一律保留。
+    if [[ "${unit_exec}" != *"/usr/local/bin/java"* ]] \
+        || [[ "${unit_exec}" != *"-Xmx256m"* ]] \
+        || [[ "${unit_exec}" != *"-Duser.timezone=Asia/Shanghai"* ]] \
+        || [[ "${unit_exec}" != *"-Duser.dir=/opt/oci-worker"* ]] \
+        || [[ "${unit_exec}" != *"oci-worker.jar"* ]] \
+        || [[ "${unit_exec}" != *"/opt/oci-worker/application.yml"* ]]; then
+        info "JVM 参数不是项目旧默认 -Xmx256m，保留现有配置"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "${JVM_DROPIN}")" || return 1
+    if [ -f "${JVM_DROPIN}" ]; then
+        JVM_DROPIN_BACKUP="${JVM_DROPIN}.bak.$(date +%Y%m%d%H%M%S)"
+        cp -p "${JVM_DROPIN}" "${JVM_DROPIN_BACKUP}" || return 1
+    else
+        JVM_DROPIN_CREATED=1
+    fi
+    dropin_tmp="${JVM_DROPIN}.tmp.$$"
+    if ! cat > "${dropin_tmp}" <<EOF
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/java -Xmx${heap_mb}m -Duser.timezone=Asia/Shanghai -Duser.dir=${INSTALL_DIR} -jar ${JAR_NAME} --spring.config.additional-location=file:${CONFIG_FILE}
+EOF
+    then
+        rm -f "${dropin_tmp}"
+        return 1
+    fi
+    if ! mv "${dropin_tmp}" "${JVM_DROPIN}"; then
+        rm -f "${dropin_tmp}"
+        return 1
+    fi
+    systemctl daemon-reload || return 1
+    ok "已将项目旧默认 JVM 堆从 256MB 自动调整为 ${heap_mb}MB"
+}
+
+rollback_managed_jvm_memory_migration() {
+    if [ -n "${JVM_DROPIN_BACKUP}" ] && [ -f "${JVM_DROPIN_BACKUP}" ]; then
+        mv "${JVM_DROPIN_BACKUP}" "${JVM_DROPIN}" \
+            || warn "恢复原 JVM 配置失败：${JVM_DROPIN_BACKUP}"
+    elif [ "${JVM_DROPIN_CREATED}" = "1" ]; then
+        rm -f "${JVM_DROPIN}" || warn "删除新 JVM 配置失败：${JVM_DROPIN}"
+    fi
+    systemctl daemon-reload 2>/dev/null || warn "systemd 重新加载失败，请手动执行 systemctl daemon-reload"
+}
+
 # 已部署环境可能仍为旧版 unit（无 TimeoutStopSec），升级时 stop 会等满 systemd 默认超时（常见 ~90s）
 apply_worker_stop_timeout_dropin() {
     mkdir -p "/etc/systemd/system/${SERVICE_NAME}.service.d"
@@ -1134,6 +1221,19 @@ apply_worker_stop_timeout_dropin() {
 TimeoutStopSec=45
 EOF
     systemctl daemon-reload
+}
+
+# JDBC 与 OCI SDK 均包含阻塞调用。Web 请求若使用虚拟线程，会和抢机循环争抢少量载体线程，
+# 可能在数据库空闲时仍出现全站 API 数十秒无响应。使用环境变量覆盖旧 application.yml，
+# 无需改写用户配置文件，且对既有安装立即生效。
+apply_platform_web_thread_isolation() {
+    mkdir -p "$(dirname "${WEB_THREAD_DROPIN}")" || return 1
+    cat > "${WEB_THREAD_DROPIN}" <<'EOF'
+[Service]
+Environment=SPRING_THREADS_VIRTUAL_ENABLED=false
+EOF
+    systemctl daemon-reload || return 1
+    ok "已启用 Web 平台线程隔离，避免 OCI 抢机阻塞面板请求"
 }
 
 # -----------------------------------------------------------------------------
@@ -1155,10 +1255,11 @@ file_size() {
 # Returns 0 on success, non-zero on failure. NEVER calls die() so callers
 # can decide whether to roll back.
 download_jar() {
+    local destination="${1:-${INSTALL_DIR}/${JAR_NAME}}"
     info "下载 JAR（Release：${JAR_RELEASE_TAG}）…"
     local url tmp size attempt max
     url="https://github.com/${REPO}/releases/download/${JAR_RELEASE_TAG}/${JAR_ASSET}"
-    tmp="${INSTALL_DIR}/${JAR_NAME}.tmp"
+    tmp="${destination}.tmp"
     max=3
     attempt=0
     while [ "${attempt}" -lt "${max}" ]; do
@@ -1189,39 +1290,78 @@ download_jar() {
             return 1
         fi
     fi
-    mv "${tmp}" "${INSTALL_DIR}/${JAR_NAME}"
-    ok "JAR 已就绪：$(numfmt --to=iec "${size}" 2>/dev/null || echo "${size} 字节")"
+    if ! mv "${tmp}" "${destination}"; then
+        rm -f "${tmp}"
+        err "JAR 写入目标路径失败：${destination}"
+        return 1
+    fi
+    ok "JAR 已就绪：${destination}（$(numfmt --to=iec "${size}" 2>/dev/null || echo "${size} 字节")）"
     return 0
 }
 
 # -----------------------------------------------------------------------------
 # Install / restart with rollback
 # -----------------------------------------------------------------------------
+configured_web_port() {
+    local port
+    port="$(awk '
+        $0 ~ /^server:/ { in_server=1; next }
+        in_server && $0 ~ /^[[:space:]]*port:[[:space:]]*[0-9]+/ {
+            gsub(/[^0-9]/, "", $0); print $0; exit
+        }
+        in_server && $0 ~ /^[^[:space:]]/ { in_server=0 }
+    ' "${CONFIG_FILE}" 2>/dev/null || true)"
+    echo "${port:-8818}"
+}
+
 restart_with_rollback() {
+    local rollback_config="${1:-yes}"
+    local probe_mode="${2:-strict}"
     info "启动 ${SERVICE_NAME}..."
     if ! systemctl restart "${SERVICE_NAME}"; then
-        warn "服务启动失败，尝试回滚配置..."
-        local last_bak
-        last_bak="$(ls -1t "${CONFIG_FILE}.bak."* 2>/dev/null | head -n 1 || true)"
-        if [ -n "${last_bak}" ]; then
-            cp -p "${last_bak}" "${CONFIG_FILE}"
-            systemctl restart "${SERVICE_NAME}" || true
-            warn "已回滚到上一个配置：${last_bak}"
+        if [ "${rollback_config}" = "yes" ]; then
+            warn "服务启动失败，尝试回滚配置..."
+            local last_bak
+            last_bak="$(ls -1t "${CONFIG_FILE}.bak."* 2>/dev/null | head -n 1 || true)"
+            if [ -n "${last_bak}" ]; then
+                cp -p "${last_bak}" "${CONFIG_FILE}"
+                systemctl restart "${SERVICE_NAME}" || true
+                warn "已回滚到上一个配置：${last_bak}"
+            fi
+        else
+            warn "服务启动失败；本次升级未修改 application.yml，不回退用户配置"
         fi
         err "请查看日志：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
         return 1
     fi
 
-    # Wait briefly for service to settle.
-    local i
-    for i in 1 2 3 4 5; do
+    # systemd active 不等于应用已就绪；使用不访问数据库的进程内探针，
+    # 避免首页鉴权或数据库恢复期间的短暂阻塞被误判为升级失败。
+    local port deadline
+    port="$(configured_web_port)"
+    deadline=$((SECONDS + 60))
+    while [ "${SECONDS}" -lt "${deadline}" ]; do
         sleep 2
         if systemctl is-active --quiet "${SERVICE_NAME}"; then
-            ok "${SERVICE_NAME} 已运行"
-            return 0
+            if curl -fsS --connect-timeout 1 --max-time 2 -o /dev/null \
+                    "http://127.0.0.1:${port}/api/sys/ready" 2>/dev/null; then
+                ok "${SERVICE_NAME} 已运行，端口 ${port} 已就绪"
+                return 0
+            fi
+            # 较早版本没有 /api/sys/ready。仅在回滚旧 JAR 时允许用首页 HTTP
+            # 响应确认进程已恢复；新版本仍必须通过严格的进程内就绪探针。
+            if [ "${probe_mode}" = "legacy" ] \
+                && curl -sS --connect-timeout 1 --max-time 2 -o /dev/null \
+                    "http://127.0.0.1:${port}/" 2>/dev/null; then
+                ok "${SERVICE_NAME} 旧版本已恢复，端口 ${port} 可访问"
+                return 0
+            fi
+        fi
+        if systemctl is-failed --quiet "${SERVICE_NAME}"; then
+            break
         fi
     done
-    warn "${SERVICE_NAME} 启动状态未稳定，请用 journalctl 查看"
+    warn "${SERVICE_NAME} 未在 60 秒内通过端口就绪检查"
     return 1
 }
 
@@ -1264,8 +1404,8 @@ EOF
 # -----------------------------------------------------------------------------
 install_ociworker_cli() {
     # Source priority:
-    #   1. Same dir as install.sh (development / cloned repo)
-    #   2. main branch raw (always up-to-date)
+    #   1. Same directory as install.sh
+    #   2. public main branch raw (always up-to-date)
     #   3. installer-latest release (fallback when raw is unreachable)
     local src=""
     local self_dir
@@ -1285,7 +1425,10 @@ install_ociworker_cli() {
             return 0
         fi
     fi
-    install -m 0755 "${src}" "${OCIWORKER_BIN}"
+    if ! install -m 0755 "${src}" "${OCIWORKER_BIN}"; then
+        warn "管理脚本安装失败（不影响主程序运行），可稍后重新执行安装器"
+        return 0
+    fi
     # python3 is required by `ociworker config` for safe YAML editing.
     if ! command -v python3 >/dev/null 2>&1; then
         info "安装 python3（被 ociworker config 子命令使用）..."
@@ -1311,14 +1454,14 @@ do_install() {
     write_application_yml
     write_systemd_unit
 
-    cleanup_legacy_terminal_component
-
     firewall_open_port "${WEB_PORT}"
     install_ociworker_cli
 
     if ! restart_with_rollback; then
         die "OCI Worker 启动失败，已尝试回滚。请查看日志后再决定是否重试。"
     fi
+
+    cleanup_legacy_terminal_component
 
     security_notice
 
@@ -1351,32 +1494,71 @@ do_upgrade() {
     info "检测到已有安装：${INSTALL_DIR}"
     info "升级模式不会修改 application.yml 和数据库"
 
+    # /run/lock 仅允许 root 写入，避免 root 安装器跟随 /tmp 中由低权限用户
+    # 预先创建的符号链接。极简系统无 /run/lock 时退回 /run。
+    local lock_dir="/run/lock"
+    [ -d "${lock_dir}" ] || lock_dir="/run"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${lock_dir}/oci-worker-upgrade.lock"
+        flock -n 9 || die "已有另一个 OCI Worker 升级正在执行，请等待完成"
+    else
+        local lock_fallback="${lock_dir}/oci-worker-upgrade.lock.d"
+        mkdir "${lock_fallback}" 2>/dev/null \
+            || die "已有另一个 OCI Worker 升级正在执行，请等待完成"
+        UPGRADE_LOCK_FALLBACK="${lock_fallback}"
+    fi
+
     install_jdk21
 
     apply_worker_stop_timeout_dropin
 
-    info "停止 ${SERVICE_NAME}..."
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    apply_platform_web_thread_isolation \
+        || die "Web 线程隔离配置失败，未继续升级"
 
-    # Backup current JAR before replacing
-    if [ -f "${INSTALL_DIR}/${JAR_NAME}" ]; then
-        cp -p "${INSTALL_DIR}/${JAR_NAME}" "${INSTALL_DIR}/${JAR_NAME}.bak"
+    # 先备份并下载校验，旧服务继续运行；仅在新包就绪后短暂停服切换。
+    if [ ! -f "${INSTALL_DIR}/${JAR_NAME}" ]; then
+        die "未找到当前 JAR：${INSTALL_DIR}/${JAR_NAME}，为避免无法回滚，未继续升级"
     fi
+    rm -f "${INSTALL_DIR}/${JAR_NAME}.bak"
+    cp -p "${INSTALL_DIR}/${JAR_NAME}" "${INSTALL_DIR}/${JAR_NAME}.bak" \
+        || die "旧 JAR 备份失败，为避免无法回滚，未继续升级"
 
-    if ! download_jar; then
+    local candidate_jar="${INSTALL_DIR}/${JAR_NAME}.candidate"
+    rm -f "${candidate_jar}" "${candidate_jar}.tmp"
+    if ! download_jar "${candidate_jar}"; then
         warn "JAR 下载失败，恢复旧版本"
-        [ -f "${INSTALL_DIR}/${JAR_NAME}.bak" ] && mv "${INSTALL_DIR}/${JAR_NAME}.bak" "${INSTALL_DIR}/${JAR_NAME}"
-        systemctl start "${SERVICE_NAME}" || true
+        rm -f "${candidate_jar}" "${candidate_jar}.tmp"
+        rm -f "${INSTALL_DIR}/${JAR_NAME}.bak"
         die "升级失败"
     fi
 
-    cleanup_legacy_terminal_component
+    info "新包已校验，停止 ${SERVICE_NAME} 并切换版本..."
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    if ! mv "${candidate_jar}" "${INSTALL_DIR}/${JAR_NAME}"; then
+        warn "新 JAR 切换失败，继续使用旧版本"
+        rm -f "${candidate_jar}" "${candidate_jar}.tmp"
+        if [ ! -f "${INSTALL_DIR}/${JAR_NAME}" ] && [ -f "${INSTALL_DIR}/${JAR_NAME}.bak" ]; then
+            cp -p "${INSTALL_DIR}/${JAR_NAME}.bak" "${INSTALL_DIR}/${JAR_NAME}" || true
+        fi
+        restart_with_rollback no legacy || warn "旧版本服务恢复失败，请立即查看 systemd 日志"
+        die "升级失败"
+    fi
+
+    if ! apply_managed_jvm_memory_migration; then
+        warn "JVM 配置迁移失败，恢复旧版本"
+        [ -f "${INSTALL_DIR}/${JAR_NAME}.bak" ] && mv "${INSTALL_DIR}/${JAR_NAME}.bak" "${INSTALL_DIR}/${JAR_NAME}"
+        rollback_managed_jvm_memory_migration
+        restart_with_rollback no legacy || warn "旧版本服务恢复失败，请立即查看 systemd 日志"
+        die "升级失败"
+    fi
 
     install_ociworker_cli
 
-    if restart_with_rollback; then
+    if restart_with_rollback no; then
+        cleanup_legacy_terminal_component
         # On success, drop the JAR backup
-        rm -f "${INSTALL_DIR}/${JAR_NAME}.bak"
+        rm -f "${INSTALL_DIR}/${JAR_NAME}.bak" "${candidate_jar}" "${candidate_jar}.tmp"
+        [ -n "${JVM_DROPIN_BACKUP}" ] && rm -f "${JVM_DROPIN_BACKUP}" || true
         ok "升级完成"
         local cur_port
         cur_port="$(awk '/^server:/{f=1;next} f && /^[^ ]/{f=0} f && /port:/{print $2; exit}' "${CONFIG_FILE}" 2>/dev/null | tr -d '"'\''' || true)"
@@ -1393,8 +1575,12 @@ EOF
         warn "新版本启动失败，回滚到旧 JAR..."
         if [ -f "${INSTALL_DIR}/${JAR_NAME}.bak" ]; then
             mv "${INSTALL_DIR}/${JAR_NAME}.bak" "${INSTALL_DIR}/${JAR_NAME}"
-            systemctl restart "${SERVICE_NAME}" || true
-            warn "已回滚到旧版本"
+        fi
+        rollback_managed_jvm_memory_migration
+        if restart_with_rollback no legacy; then
+            warn "已回滚到旧版本和原 JVM 配置，旧服务已恢复"
+        else
+            err "旧 JAR 和 JVM 配置已恢复，但服务未能重新就绪，请立即查看 systemd 日志"
         fi
         die "升级失败，请查看日志"
     fi
