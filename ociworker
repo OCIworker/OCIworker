@@ -307,6 +307,13 @@ parts = path.split('.')
 def yaml_escape(s):
     return s.replace('\\', '\\\\').replace('"', '\\"')
 
+def render(v):
+    # 数字/布尔/空值按标量原样写出。端口这类值加引号虽然 Spring 仍能解析，
+    # 但会让配置文件看起来像被改坏了，排查时容易误导。
+    if re.fullmatch(r'-?\d+', v) or v.lower() in ('true', 'false', 'null', '~'):
+        return v
+    return '"%s"' % yaml_escape(v)
+
 with open(fpath, 'r', encoding='utf-8') as f:
     lines = f.readlines()
 
@@ -335,7 +342,7 @@ for line in lines:
     stack.append((indent, key))
     cur_path = [k for _, k in stack]
     if (not replaced) and cur_path == parts:
-        new_lines.append(f'{" " * indent}{key}: "{yaml_escape(val)}"\n')
+        new_lines.append(f'{" " * indent}{key}: {render(val)}\n')
         replaced = True
     else:
         new_lines.append(line)
@@ -393,18 +400,26 @@ cmd_config() {
     require_installed
     section "修改配置"
 
-    local cur_port cur_db_url cur_db_user
+    local cur_port cur_db_url cur_db_user cur_ai_port cur_lb_port
     cur_port="$(yaml_get server.port)"
     cur_db_url="$(yaml_get spring.datasource.url)"
     cur_db_user="$(yaml_get spring.datasource.username)"
+    # 这两项通常不写在外部 application.yml 里，由 JAR 内默认值提供。
+    cur_ai_port="$(yaml_get ociworker.openaiApi.port)"; [ -n "${cur_ai_port}" ] || cur_ai_port="8080"
+    cur_lb_port="$(yaml_get ociworker.openaiLoadBalance.port)"; [ -n "${cur_lb_port}" ] || cur_lb_port="50000"
 
-    echo "当前端口:     ${cur_port}"
+    echo "当前端口:     ${cur_port}  (面板)"
+    echo "AI 网关端口:  ${cur_ai_port} (/v1)  ${cur_lb_port} (负载均衡)  30000-39999 (多租户，按需启用)"
     echo "当前 DB URL:  ${cur_db_url}"
     echo "当前 DB 用户: ${cur_db_user}"
     echo
-    echo "[规则] 每次修改会自动重启服务验证新配置。"
-    echo "       启动失败会自动回滚到上一份 application.yml，无需手动停服。"
+    echo "[规则] 每次修改会自动重启，并探活 http://127.0.0.1:<端口>/api/sys/ready 确认真的可访问。"
+    echo "       探活失败会自动回滚到上一份 application.yml，无需手动停服。"
     echo "       手动备份历史保存在 /opt/oci-worker/application.yml.bak.*"
+    echo
+    echo "[注意] 改端口只会放行本机防火墙。若使用云主机，还需在云控制台放行新端口"
+    echo "       （OCI：网络 → VCN → 安全列表 → 入站规则），否则外部依旧连不上。"
+    echo "       上面列出的 AI 网关端口同样需要放行才能从外部调用。"
     echo
     echo "[提示] 管理员账号/密码请在 Web 界面里修改（设置 -> 安全）。"
     echo
@@ -417,6 +432,13 @@ cmd_config() {
                 local new_port; new_port="$(ask "新 Web 端口" "${cur_port}")"
                 if [[ ! "${new_port}" =~ ^[0-9]+$ ]] || [ "${new_port}" -lt 1 ] || [ "${new_port}" -gt 65535 ]; then
                     warn "端口无效"; continue
+                fi
+                # 与 AI 网关端口撞车会导致 /v1 或面板其一起不来，先挡住。
+                if [ "${new_port}" = "${cur_ai_port}" ] || [ "${new_port}" = "${cur_lb_port}" ]; then
+                    warn "端口 ${new_port} 已被 AI 网关占用，请换一个"; continue
+                fi
+                if [ "${new_port}" -ge 30000 ] && [ "${new_port}" -le 39999 ]; then
+                    warn "30000-39999 为多租户 AI 网关保留区间，请换一个"; continue
                 fi
                 _backup_and_apply server.port "${new_port}" || true
                 ;;
@@ -512,6 +534,79 @@ EOF
     return 1
 }
 
+# OCI 官方镜像默认不启用 ufw/firewalld，而由 netfilter-persistent 管理一组裸 iptables
+# 规则、链尾通常是 REJECT。改端口后若不放行新端口，服务正常监听却怎么都连不上。
+_firewall_open_port() {
+    local port="$1"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+        info "ufw 已放行 ${port}/tcp"
+        return 0
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        info "firewalld 已放行 ${port}/tcp"
+        return 0
+    fi
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    # 链里没有任何拒绝动作时不插规则：端口本就通，多插一条反而会覆盖
+    # 使用者自己配置的精细限制（例如只允许特定来源访问面板）。
+    if ! iptables -S INPUT 2>/dev/null \
+        | grep -qE '^-P INPUT (DROP|REJECT)|^-A INPUT .*-j (DROP|REJECT)'; then
+        return 0
+    fi
+    if iptables -C INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
+        return 0
+    fi
+    # 必须插到链首：默认规则链尾是 REJECT，追加到末尾永远匹配不到。
+    if ! iptables -I INPUT 1 -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
+        warn "iptables 放行失败，请手动执行：iptables -I INPUT 1 -p tcp --dport ${port} -j ACCEPT"
+        return 0
+    fi
+    info "iptables 已放行 ${port}/tcp"
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+    elif [ -f /etc/iptables/rules.v4 ] && command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    elif [ -f /etc/sysconfig/iptables ] && command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+    else
+        warn "未找到 iptables 持久化方式，重启后放行规则会丢失"
+    fi
+}
+
+# 判定「改配置后服务是否真的可用」。
+#
+# 不能只看 systemctl is-active：unit 是 Type=simple，进程一拉起来就算 active，
+# 哪怕应用还在初始化、马上要崩，或者端口被防火墙挡着根本连不上——这些情况下
+# 旧逻辑一律判定成功，自动回滚永远不会触发，用户以为回滚了其实什么都没回。
+# /api/sys/ready 专为轻量就绪检查设计，不查数据库，适合做探针。
+_wait_healthy() {
+    local port="$1" tries="${2:-20}" i
+    if ! command -v curl >/dev/null 2>&1; then
+        # 没有 curl 时退回旧判据，至少不比原来差。
+        sleep 8
+        if systemctl is-active --quiet "${SERVICE_NAME}"; then
+            return 0
+        fi
+        return 1
+    fi
+    for i in $(seq 1 "${tries}"); do
+        sleep 2
+        if curl -fsS -o /dev/null --max-time 3 \
+            "http://127.0.0.1:${port}/api/sys/ready" 2>/dev/null; then
+            return 0
+        fi
+        # 已经进入 failed 就不必等满整个窗口。
+        if systemctl is-failed --quiet "${SERVICE_NAME}"; then
+            return 1
+        fi
+    done
+    return 1
+}
+
 # Backup current yml, apply yaml_set, restart with rollback on failure.
 _backup_and_apply() {
     local path="$1" val="$2"
@@ -522,20 +617,30 @@ _backup_and_apply() {
         cp -p "${bak}" "${CONFIG_FILE}"; rm -f "${bak}"
         return 1
     fi
-    info "已写入 ${path}，正在重启服务测试..."
-    if systemctl restart "${SERVICE_NAME}"; then
-        # Wait briefly to confirm it stays up
-        local i
-        for i in 1 2 3 4 5; do
-            sleep 2
-            systemctl is-active --quiet "${SERVICE_NAME}" || { systemctl is-failed --quiet "${SERVICE_NAME}" && break; }
-        done
-        if systemctl is-active --quiet "${SERVICE_NAME}"; then
-            ok "修改生效（备份保留：${bak}）"
-            return 0
-        fi
+    # 探活要打在改动之后的端口上；改数据库等其它项时端口不变。
+    local probe_port
+    if [ "${path}" = "server.port" ]; then
+        probe_port="${val}"
+        # 先放行再重启：若 iptables 链尾是 REJECT，回环探针同样会被挡，
+        # 那样即使服务完全正常也会被误判为失败而白白回滚。
+        # 脚本启用了 set -e，放行失败不应中断改端口流程。
+        _firewall_open_port "${val}" || true
+    else
+        probe_port="$(yaml_get server.port)"
     fi
-    warn "服务启动失败，回滚..."
+
+    info "已写入 ${path}，正在重启并探活 127.0.0.1:${probe_port} ..."
+    if systemctl restart "${SERVICE_NAME}" && _wait_healthy "${probe_port}"; then
+        ok "修改生效，服务已可访问（备份保留：${bak}）"
+        if [ "${path}" = "server.port" ]; then
+            echo
+            info "如需从外部访问，请确认云防火墙同样放行了 ${val}/tcp"
+            info "（OCI：控制台 → 网络 → VCN → 安全列表 → 入站规则；实例外的规则本脚本无法修改）"
+        fi
+        return 0
+    fi
+
+    warn "服务未在预期时间内变为可访问，回滚..."
     cp -p "${bak}" "${CONFIG_FILE}"
     systemctl restart "${SERVICE_NAME}" || true
     err "已回滚到上一版配置（${bak}）。请查看：journalctl -u ${SERVICE_NAME} -n 50 --no-pager"

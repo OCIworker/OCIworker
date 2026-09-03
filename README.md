@@ -155,7 +155,7 @@ ociworker config   # 选 2) 数据库修改 / 迁移，按提示填新库的地�
 
 ```yaml
 server:
-  port: 8818            # 服务端口
+  port: 6699            # 服务端口
 
 web:
   account: admin        # 默认登录账号（首次安装时会在页面设置新的）

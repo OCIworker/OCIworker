@@ -30,6 +30,10 @@ readonly JAR_NAME="oci-worker.jar"
 readonly JAR_ASSET="oci-worker-1.0.0.jar"
 readonly CONFIG_FILE="${INSTALL_DIR}/application.yml"
 readonly SERVICE_NAME="oci-worker"
+# 新安装的默认面板端口。早期版本用 8818，与另一个同类项目相同，其漏洞被公开后
+# 出现了针对 8818 的定向扫描，本项目用户会被一并波及，故换到冷门端口。
+# 升级不会改动既有 application.yml，存量部署仍保持原端口。
+readonly DEFAULT_WEB_PORT="6699"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly WEB_THREAD_DROPIN="/etc/systemd/system/${SERVICE_NAME}.service.d/30-platform-web-threads.conf"
 readonly LEGACY_TERMINAL_BIN="${INSTALL_DIR}/oci-webssh"
@@ -1027,7 +1031,7 @@ WEB_DEFAULT_PASSWORD=""
 prompt_web() {
     section "Web 服务配置"
     while true; do
-        WEB_PORT="$(ask "OCI Worker Web 端口" "8818")"
+        WEB_PORT="$(ask "OCI Worker Web 端口" "${DEFAULT_WEB_PORT}")"
         if [[ "${WEB_PORT}" =~ ^[0-9]+$ ]] && [ "${WEB_PORT}" -ge 1 ] && [ "${WEB_PORT}" -le 65535 ]; then
             if [ "${WEB_PORT}" -eq 8008 ]; then
                 warn "端口 8008 不可用，请换一个"
@@ -1311,7 +1315,7 @@ configured_web_port() {
         }
         in_server && $0 ~ /^[^[:space:]]/ { in_server=0 }
     ' "${CONFIG_FILE}" 2>/dev/null || true)"
-    echo "${port:-8818}"
+    echo "${port:-${DEFAULT_WEB_PORT}}"
 }
 
 restart_with_rollback() {
@@ -1377,7 +1381,64 @@ firewall_open_port() {
         firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
         info "firewalld 已放行 ${port}/tcp"
+    else
+        iptables_open_port "${port}"
     fi
+}
+
+# OCI 官方镜像默认不启用 ufw/firewalld，而是由 netfilter-persistent 管理一组裸 iptables
+# 规则，链尾通常是 REJECT。此前这里只处理 ufw/firewalld，两者都不可用时静默跳过，
+# 导致换端口后新端口永远没有放行规则——服务正常监听却怎么都连不上。
+iptables_open_port() {
+    local port="$1"
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    # 链里没有任何拒绝动作时不插规则：此时端口本就通，多插一条反而会覆盖
+    # 使用者自己可能配置的精细限制（例如只允许特定来源访问面板）。
+    if ! iptables -S INPUT 2>/dev/null \
+        | grep -qE '^-P INPUT (DROP|REJECT)|^-A INPUT .*-j (DROP|REJECT)'; then
+        return 0
+    fi
+
+    # 已放行则不重复插入，保证反复执行安装/改端口是幂等的。
+    if iptables -C INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
+        info "iptables 已存在 ${port}/tcp 放行规则"
+        return 0
+    fi
+
+    # 必须插到链首：OCI 默认规则链尾是 REJECT，追加到末尾永远匹配不到。
+    if ! iptables -I INPUT 1 -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
+        warn "iptables 放行 ${port}/tcp 失败，请手动执行：iptables -I INPUT 1 -p tcp --dport ${port} -j ACCEPT"
+        return 0
+    fi
+    info "iptables 已放行 ${port}/tcp（规则插入 INPUT 链首）"
+    iptables_persist
+}
+
+# 不持久化的话重启就丢，面板会再次变成打不开。
+# 注意脚本启用了 set -e：这里所有可能失败的命令都必须包在 if 条件里，
+# 否则一次保存失败就会让整个安装/升级流程中途退出。
+iptables_persist() {
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        if netfilter-persistent save >/dev/null 2>&1; then
+            info "iptables 规则已持久化"
+            return 0
+        fi
+    fi
+    if [ -f /etc/iptables/rules.v4 ] && command -v iptables-save >/dev/null 2>&1; then
+        if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+            info "iptables 规则已写入 /etc/iptables/rules.v4"
+            return 0
+        fi
+    fi
+    if [ -f /etc/sysconfig/iptables ] && command -v iptables-save >/dev/null 2>&1; then
+        if iptables-save > /etc/sysconfig/iptables 2>/dev/null; then
+            info "iptables 规则已写入 /etc/sysconfig/iptables"
+            return 0
+        fi
+    fi
+    warn "未找到 iptables 持久化方式，重启后放行规则会丢失；请自行保存（如 netfilter-persistent save）"
+    return 0
 }
 
 cleanup_legacy_terminal_component() {
@@ -1396,6 +1457,12 @@ security_notice() {
     section "安全提醒"
     cat >&2 <<EOF
 * 推荐：用 Nginx 反向代理 + HTTPS（Let's Encrypt）保护 ${WEB_PORT}。
+* 已自动放行本机防火墙的 ${WEB_PORT}/tcp。若使用云主机，还需在云控制台放行
+  （OCI：网络 → VCN → 安全列表 → 入站规则），否则外部依旧连不上。
+* AI 网关另占用这些端口，默认不放行；需要从外部调用时请自行开放：
+    8080          OpenAI 兼容 /v1
+    50000         负载均衡网关
+    30000-39999   多租户网关（按启用的租户数量动态占用）
 EOF
 }
 
@@ -1562,7 +1629,7 @@ do_upgrade() {
         ok "升级完成"
         local cur_port
         cur_port="$(awk '/^server:/{f=1;next} f && /^[^ ]/{f=0} f && /port:/{print $2; exit}' "${CONFIG_FILE}" 2>/dev/null | tr -d '"'\''' || true)"
-        cur_port="${cur_port:-8818}"
+        cur_port="${cur_port:-${DEFAULT_WEB_PORT}}"
         local pub_ip
         pub_ip="$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "<your-server-ip>")"
         section "升级完成"
