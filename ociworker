@@ -14,6 +14,9 @@
 #   ociworker backup           Backup db dump + application.yml + keys
 #   ociworker restore <file>   Restore from a backup tarball
 #   ociworker tg-clean         Clear Telegram bot binding (oci_kv); re-bind in web UI
+#   ociworker backup-unlock    Unlock backup verification after five incorrect codes
+#   ociworker gateway <action> Manage HTTPS: install, status, apply, rollback, recover,
+#                             upgrade, rollback-binary, cleanup
 #   ociworker uninstall        Uninstall everything (asks before each step)
 #   ociworker version          Show installer version + jar info
 #
@@ -679,6 +682,7 @@ cmd_backup() {
     cp -a "${CONFIG_FILE}" "${stage}/application.yml"
     [ -d "${KEYS_DIR}" ] && cp -a "${KEYS_DIR}" "${stage}/keys" || true
 
+    _gateway_transfer_state backup "$stage"
     info "备份数据库..."
     if ! command -v mysqldump >/dev/null 2>&1; then
         warn "未安装 mysqldump，跳过数据库备份（仅备份配置和密钥）"
@@ -702,7 +706,10 @@ cmd_backup() {
         fi
     fi
 
+    local backup_umask; backup_umask="$(umask)"
+    umask 077
     tar -czf "${out}" -C "${stage}" . || die "打包失败"
+    umask "$backup_umask"
     ok "备份完成：${out}"
     ls -lh "${out}"
 }
@@ -745,6 +752,20 @@ cmd_tg_clean() {
     ok "telegram通知已清除，请登录面板重新绑定。"
 }
 
+cmd_backup_unlock() {
+    require_root backup-unlock
+    require_installed
+    section "解除备份验证锁定"
+    echo "将清除备份验证码的错误次数和锁定状态；解锁后须在面板重新获取验证码。"
+    [ "$(ask_yes_no "确认解除备份验证锁定？" "N")" = "y" ] || { info "已取消"; return 0; }
+    _mysql_ensure_mode
+    if ! _mysql_exec "DELETE FROM oci_kv WHERE type='sys' AND code='backup_verify_state';"; then
+        err "解除失败，请检查数据库连接后重试。"
+        return 1
+    fi
+    ok "备份验证锁定已解除，无需重启服务。请在面板重新获取备份验证码。"
+}
+
 cmd_restore() {
     require_root restore
     require_installed
@@ -758,6 +779,7 @@ cmd_restore() {
     local stage; stage="$(mktemp -d)"
     trap "rm -rf '${stage}'" RETURN
     tar -xzf "${file}" -C "${stage}" || die "解压失败"
+    _gateway_transfer_state inspect "$stage" || die "HTTPS 备份校验失败，当前服务和数据未改变"
 
     systemctl stop "${SERVICE_NAME}" || true
 
@@ -791,9 +813,783 @@ cmd_restore() {
         fi
     fi
 
+    _gateway_transfer_state restore "$stage"
     systemctl start "${SERVICE_NAME}"
-    ok "恢复完成"
+    ok "恢复完成。若备份含 HTTPS，请检查域名模块草稿后重新应用；可使用原端口或 SSH 本地转发访问。"
 }
+
+_gateway_transfer_state() {
+    local mode="$1" stage="$2" groot="/opt/oci-worker/https-gateway"
+    case "$mode" in backup|inspect|restore) ;; *) die "不支持的 HTTPS 状态传输操作" ;; esac
+    if [ ! -f "$groot/control/state.json" ] && [ ! -f "$stage/https-gateway/control/state.json" ]; then return 0; fi
+    command -v python3 >/dev/null || die "HTTPS 状态备份或恢复需要 python3"
+    if [ "$mode" = restore ]; then
+        _gateway_transfer_state inspect "$stage" || return 1
+        cmd_gateway recover || die "无法停用 HTTPS，请先恢复入口后再还原备份"
+    fi
+    python3 - "$mode" "$groot" "$stage" <<'PY_GATEWAY'
+import json, os, pathlib, sys
+mode, root, stage = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+source, target = (root, stage / "https-gateway") if mode == "backup" else (stage / "https-gateway", root)
+try:
+    def reject_links(path):
+        if any(part.is_symlink() for part in (path, *path.parents)): raise ValueError()
+    for part in (source, source / "control", target, target / "control", target / "storage"):
+        reject_links(part)
+    state_file = source / "control/state.json"
+    if state_file.is_symlink() or (state_file.exists() and (not state_file.is_file() or state_file.stat().st_size > 16 * 1024 * 1024)):
+        raise ValueError()
+    state = json.loads(state_file.read_text("utf-8")) if state_file.exists() else {"format": 1, "revision": 0, "sites": []}
+    if not isinstance(state, dict) or state.get("format") != 1: raise ValueError()
+    if type(state.get("revision", 0)) is not int or not 0 <= state.get("revision", 0) < 9223372036854775807: raise ValueError()
+    for name, limit in (("sites", 20), ("appliedSites", 20), ("previousSites", 20), ("tasks", 30), ("events", 150)):
+        values = state.get(name, [])
+        if not isinstance(values, list) or len(values) > limit or any(not isinstance(value, dict) for value in values): raise ValueError()
+    if mode == "backup" and any(t.get("status") in ("queued", "running") for t in state.get("tasks", [])): raise ValueError()
+    if mode == "restore":
+        state.update(restrictDirect=False, ingressSecretEncrypted=None, appliedSites=[], previousSites=[],
+                     appliedTaskId=None, previousTaskId=None, appliedRevision=-1, tasks=[], notificationStates={},
+                     revision=state.get("revision", 0) + 1)
+    total = count = 0
+    entries = []
+    storage = source / "storage"
+    if storage.exists():
+        if storage.is_symlink() or not storage.is_dir(): raise ValueError()
+        for current, dirs, files in os.walk(storage):
+            current = pathlib.Path(current)
+            if any((current / name).is_symlink() for name in dirs + files): raise ValueError()
+            dest = target / "storage" / current.relative_to(storage)
+            reject_links(dest)
+            for name in files:
+                if name.endswith(".lock"): continue
+                item = current / name
+                total += item.stat().st_size; count += 1
+                if not item.is_file() or item.stat().st_size > 16 * 1024 * 1024 or total > 64 * 1024 * 1024 or count > 2000: raise ValueError()
+                destination = dest / name
+                if destination.is_symlink(): raise ValueError()
+                entries.append((item, destination))
+    temporary = target / "control/state.json.transfer"
+    if temporary.is_symlink(): raise ValueError()
+    if mode == "inspect": sys.exit(0)
+    (target / "control").mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(target / "control", 0o700)
+    for item, destination in entries:
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(destination, "wb") as output: output.write(item.read_bytes())
+        os.chmod(destination, 0o600)
+    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    temporary.replace(target / "control/state.json")
+except Exception:
+    print("HTTPS 状态备份或恢复失败：请检查任务是否结束、配置格式、目录权限及文件大小", file=sys.stderr)
+    sys.exit(1)
+PY_GATEWAY
+}
+
+# HTTPS uses its own account, files and Unix control socket. It never reads keys/.
+_gateway_maintenance_files() {
+    local mode="$1" job="${2:-}" groot="/opt/oci-worker/https-gateway"
+    python3 - "$mode" "$groot" "$job" <<'PY'
+import hashlib, json, os, re, shutil, socket, ssl, stat, subprocess, sys, time, uuid
+from pathlib import Path
+
+mode, root_arg, job = sys.argv[1:]
+root = Path(root_arg).absolute()
+control, binary_dir, config, candidates = (root / name for name in ('control', 'bin', 'config', 'candidates'))
+current, previous = binary_dir / 'ociworker-gateway', binary_dir / 'ociworker-gateway.previous'
+journal = binary_dir / '.component-transaction'
+staging = binary_dir / '.component-prepare'
+config_journal, config_staging = config / '.transaction', config / '.transaction-prepare'
+config_files = {'active.json', 'active.id', 'previous.json', 'previous.id'}
+info_path, recovery = control / 'component.json', control / 'recovery.flag'
+
+def safe(path):
+    path = path.absolute()
+    if path != root and root not in path.parents: raise ValueError('path outside module')
+    for parent in [path, *path.parents]:
+        if parent.is_symlink(): raise ValueError('symlink refused')
+    return path
+
+def read_json(path, default=None, limit=16*1024*1024):
+    safe(path)
+    if not path.exists(): return default
+    if not path.is_file() or path.stat().st_size > limit: raise ValueError('invalid metadata')
+    value = json.loads(path.read_text('utf-8'))
+    if not isinstance(value, dict): raise ValueError('invalid metadata')
+    return value
+
+def write(path, value):
+    safe(path)
+    temporary = path.with_name('.' + path.name + '.' + uuid.uuid4().hex)
+    try:
+        with temporary.open('x', encoding='utf-8') as output:
+            os.chmod(temporary, 0o600)
+            json.dump(value, output, ensure_ascii=False)
+            output.flush(); os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists(): temporary.unlink()
+
+def copy_file(source, target):
+    safe(source); safe(target)
+    if not source.is_file(): raise ValueError('missing component snapshot')
+    temporary = target.with_name('.' + target.name + '.' + uuid.uuid4().hex)
+    try:
+        shutil.copyfile(source, temporary)
+        metadata = source.stat()
+        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+        if os.name != 'nt': os.chown(temporary, metadata.st_uid, metadata.st_gid)
+        with temporary.open('rb+') as synced: os.fsync(synced.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists(): temporary.unlink()
+
+def marker():
+    safe(recovery)
+    if not recovery.exists(): return ''
+    if not recovery.is_file() or recovery.stat().st_size > 4096: raise ValueError('invalid recovery marker')
+    return hashlib.sha256(recovery.read_bytes()).hexdigest()
+
+def task_marker():
+    state = read_json(control / 'state.json', {})
+    for task in state.get('tasks', []):
+        if task.get('id') == job:
+            value = task.get('recoveryMarker')
+            if value is not None:
+                if value != '' and not re.fullmatch('[a-f0-9]{64}', value): raise ValueError('invalid task recovery marker')
+                return value
+    return marker()
+
+def describe(path):
+    safe(path)
+    if not path.exists(): return {'version': '', 'sha256': ''}
+    if not path.is_file(): raise ValueError('invalid component')
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024*1024), b''): digest.update(block)
+    version = subprocess.run([str(path), 'version'], capture_output=True, timeout=8, check=True).stdout.decode('utf-8').strip().split()[0]
+    if not re.fullmatch(r'v?[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+_-]*', version): raise ValueError('invalid version')
+    return {'version': version, 'sha256': digest.hexdigest()}
+
+def publish_info(completed_job=None):
+    info = read_json(info_path, {}, 32768)
+    active, prior = describe(current), describe(previous)
+    info.update(version=active['version'], sha256=active['sha256'], previousVersion=prior['version'], previousSha256=prior['sha256'], updatedAt=int(time.time()*1000))
+    if completed_job: info['lastTaskId'] = completed_job
+    write(info_path, info)
+
+def transaction():
+    value = read_json(journal / 'state.json', None, 32768)
+    if value is None or value.get('job') != job or not re.fullmatch('[a-f0-9]{32}', job): raise ValueError('component transaction mismatch')
+    if any(type(value.get(key)) is not bool for key in ('wasRunning', 'previous', 'info')): raise ValueError('invalid transaction flags')
+    if value.get('recovery') != '' and not re.fullmatch('[a-f0-9]{64}', value.get('recovery', '')): raise ValueError('invalid recovery snapshot')
+    return value
+
+def clear_journal(directory=journal, allowed=None):
+    safe(directory)
+    if allowed is None: allowed = {'state.json', 'current.before', 'previous.before', 'info.before'}
+    entries = list(directory.iterdir())
+    for entry in entries:
+        safe(entry)
+        temporary = any(re.fullmatch(r'\.' + re.escape(name) + r'\.[a-f0-9]{32}', entry.name) for name in allowed)
+        if (entry.name not in allowed and not temporary) or not entry.is_file(): raise ValueError('unexpected transaction material')
+    for entry in entries: entry.unlink()
+    directory.rmdir()
+
+def configuration_transaction():
+    value = read_json(config_journal / 'state.json', None, 32768)
+    if not value or value.get('job') != job or not re.fullmatch('[a-f0-9]{32}', job): raise ValueError('configuration transaction mismatch')
+    if value.get('kind') not in ('apply', 'rollback') or type(value.get('wasRunning')) is not bool: raise ValueError('invalid configuration transaction')
+    if not isinstance(value.get('files'), list) or not set(value['files']).issubset(config_files): raise ValueError('invalid configuration snapshot')
+    if not re.fullmatch('[a-f0-9]{32}', value.get('targetId', '')): raise ValueError('invalid configuration target')
+    return value
+
+def configuration_committed(value):
+    state = read_json(control / 'state.json', {})
+    active = safe(config / 'active.id')
+    return active.is_file() and state.get('appliedTaskId') == value.get('targetId') == active.read_text('utf-8').strip()
+
+def prepare_configuration(kind):
+    if not re.fullmatch('[a-f0-9]{32}', job): raise ValueError('invalid task ID')
+    if config_journal.exists():
+        old = read_json(config_journal / 'state.json', {}, 32768)
+        if not configuration_committed(old): raise ValueError('unfinished configuration transaction')
+        clear_journal(config_journal, config_files | {'state.json'})
+    if config_staging.exists(): clear_journal(config_staging, config_files | {'state.json'})
+    files = []
+    for name in ('active', 'previous'):
+        data, identifier = safe(config / (name + '.json')), safe(config / (name + '.id'))
+        if data.exists() != identifier.exists(): raise ValueError('incomplete configuration pair')
+        if data.exists():
+            read_json(data)
+            if identifier.stat().st_size > 80 or not re.fullmatch('[a-f0-9]{32}', identifier.read_text('utf-8').strip()): raise ValueError('invalid configuration ID')
+            files.extend((name + '.json', name + '.id'))
+    target = job if kind == 'apply' else (config / 'previous.id').read_text('utf-8').strip()
+    running = subprocess.run(['systemctl', 'is-active', '--quiet', 'oci-worker-gateway']).returncode == 0
+    config_staging.mkdir(mode=0o700)
+    for name in files: copy_file(config / name, config_staging / name)
+    write(config_staging / 'state.json', {'job': job, 'kind': kind, 'files': files, 'wasRunning': running, 'targetId': target})
+    os.replace(config_staging, config_journal)
+
+def handshake(host, port, verify=False):
+    context = ssl.create_default_context() if verify else ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if not verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    with socket.create_connection(('127.0.0.1', port), timeout=4) as connection:
+        with context.wrap_socket(connection, server_hostname=host) as tls:
+            return hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
+
+def capture_health():
+    state = read_json(control / 'state.json', {})
+    if not state.get('appliedTaskId') or state['appliedTaskId'] != (config / 'active.id').read_text('utf-8').strip():
+        raise ValueError('runtime configuration has not been committed')
+    port = state.get('appliedHttpsPort', 443)
+    if type(port) is not int or not 1 <= port <= 65535: raise ValueError('invalid HTTPS port')
+    endpoints = []
+    for site in state.get('appliedSites', []):
+        if not site.get('enabled', True): continue
+        host = site.get('hostname', '')
+        if host.startswith('*.'): host = 'ociworker-check.' + host[2:]
+        if len(host) > 253 or not re.fullmatch('[a-z0-9.-]+', host): raise ValueError('invalid TLS hostname')
+        endpoints.append({'host': host, 'port': port, 'sha256': handshake(host, port),
+                          'automatic': site.get('certificateSource', 'automatic') == 'automatic'})
+    if not endpoints: raise ValueError('no committed HTTPS endpoint')
+    return endpoints
+
+def health():
+    value = transaction()
+    if not value['wasRunning']: return
+    remaining = list(value.get('endpoints', []))
+    if not remaining: raise ValueError('missing TLS baseline')
+    deadline = time.monotonic() + 40
+    while remaining:
+        if marker() != value['recovery']: raise ValueError('SSH recovery interrupted health check')
+        for endpoint in remaining[:]:
+            try:
+                fingerprint = handshake(endpoint['host'], endpoint['port'])
+                if fingerprint == endpoint['sha256']: remaining.remove(endpoint)
+                elif endpoint.get('automatic'):
+                    # A legitimate ACME renewal may overlap the restart. Verify trust and hostname before accepting it.
+                    handshake(endpoint['host'], endpoint['port'], verify=True)
+                    remaining.remove(endpoint)
+            except (OSError, ssl.SSLError): pass
+        if not remaining: return
+        if time.monotonic() >= deadline: raise ValueError('TLS health check failed')
+        time.sleep(1)
+
+def prune():
+    safe(candidates)
+    state = read_json(control / 'state.json', {})
+    tasks = state.get('tasks', [])
+    if not isinstance(tasks, list): raise ValueError('invalid task state')
+    busy = [task for task in tasks if task.get('status') in ('queued', 'running')]
+    keep = {task.get('id') for task in busy}
+    keep.update(state.get(key) for key in ('appliedTaskId', 'previousTaskId'))
+    # Delete completed transaction snapshots only after Java has committed the same runtime.
+    active_id = (config / 'active.id').read_text('utf-8').strip() if safe(config / 'active.id').is_file() else ''
+    if config_journal.exists():
+        transaction_info = read_json(config_journal / 'state.json', {}, 32768)
+        if not busy and configuration_committed(transaction_info): clear_journal(config_journal, config_files | {'state.json'})
+    if not busy and active_id and active_id == state.get('appliedTaskId'):
+        for name in ('transaction.id', 'before-apply.id', 'before-apply.json', 'was-running'):
+            item = safe(config / name)
+            if item.exists():
+                if not item.is_file(): raise ValueError('invalid configuration marker')
+                item.unlink()
+    for name in ('active', 'previous', 'before-apply', 'swap', 'transaction'):
+        identifier = safe(config / (name + '.id'))
+        if identifier.exists():
+            value = identifier.read_text('utf-8').strip()
+            if not re.fullmatch('[a-f0-9]{32}', value): raise ValueError('invalid configuration ID')
+            keep.add(value)
+        data = read_json(config / (name + '.json'), {})
+        def references(node):
+            if isinstance(node, dict):
+                for value in node.values(): references(value)
+            elif isinstance(node, list):
+                for value in node: references(value)
+            elif isinstance(node, str):
+                normalized = node.replace('\\', '/')
+                prefix = candidates.as_posix().rstrip('/') + '/'
+                if normalized.startswith(prefix): keep.add(normalized[len(prefix):].split('/')[0])
+        references(data)
+    if config_journal.exists():
+        for name in ('active', 'previous'):
+            references(read_json(config_journal / (name + '.json'), {}))
+            identifier = safe(config_journal / (name + '.id'))
+            if identifier.exists(): keep.add(identifier.read_text('utf-8').strip())
+    removed, removed_bytes, retained = 0, 0, 0
+    pending = []
+    for directory in candidates.iterdir() if candidates.exists() else []:
+        safe(directory)
+        if not directory.is_dir() or not re.fullmatch('[a-f0-9]{32}', directory.name): raise ValueError('unexpected candidate path')
+        entries = list(directory.iterdir())
+        for entry in entries:
+            safe(entry)
+            if not entry.is_file() or not (entry.name == 'gateway.json' or re.fullmatch(r'[a-f0-9]{32}\.(crt|key)', entry.name)):
+                raise ValueError('unexpected candidate material')
+        newest = max([directory.stat().st_mtime] + [entry.stat().st_mtime for entry in entries])
+        # A grace period also protects new files created between state snapshots.
+        if directory.name in keep or time.time() - newest < 86400:
+            retained += 1; continue
+        pending.append((directory, entries))
+    # Validate the complete deletion set before removing anything.
+    for directory, entries in pending:
+        for entry in entries:
+            removed_bytes += entry.stat().st_size; entry.unlink()
+        directory.rmdir(); removed += 1
+    info = read_json(info_path, {}, 32768)
+    info.update(lastCleanupAt=int(time.time()*1000), removedCandidates=removed, removedBytes=removed_bytes, retainedCandidates=retained)
+    write(info_path, info)
+
+try:
+    safe(root); safe(control); safe(binary_dir); safe(journal); safe(staging); safe(config_journal); safe(config_staging)
+    if mode == 'info':
+        if job and not re.fullmatch('[a-f0-9]{32}', job): raise ValueError('invalid task ID')
+        publish_info(job)
+    elif mode == 'marker': print(marker())
+    elif mode == 'task-marker': print(task_marker())
+    elif mode == 'recover': write(recovery, {'id': uuid.uuid4().hex, 'time': int(time.time()*1000)})
+    elif mode == 'health': health()
+    elif mode == 'pending':
+        value = read_json(journal / 'state.json', {}, 32768)
+        pending = value.get('job', '')
+        if pending and not re.fullmatch('[a-f0-9]{32}', pending): raise ValueError('invalid transaction ID')
+        print(pending)
+    elif mode == 'committed': sys.exit(0 if job and read_json(info_path, {}, 32768).get('lastTaskId') == job else 1)
+    elif mode in ('config-prepare-apply', 'config-prepare-rollback'): prepare_configuration(mode[len('config-prepare-'):])
+    elif mode == 'config-pending':
+        pending = read_json(config_journal / 'state.json', {}, 32768).get('job', '')
+        if pending and not re.fullmatch('[a-f0-9]{32}', pending): raise ValueError('invalid configuration transaction')
+        print(pending)
+    elif mode == 'config-was-running': sys.exit(0 if configuration_transaction()['wasRunning'] else 1)
+    elif mode == 'config-committed': sys.exit(0 if configuration_committed(configuration_transaction()) else 1)
+    elif mode == 'config-ready':
+        if config_journal.exists():
+            if not configuration_committed(read_json(config_journal / 'state.json', {}, 32768)): raise ValueError('unfinished configuration transaction')
+            clear_journal(config_journal, config_files | {'state.json'})
+    elif mode == 'config-restore':
+        value = configuration_transaction()
+        for name in sorted(config_files):
+            if name in value['files']: copy_file(config_journal / name, config / name)
+            elif safe(config / name).exists(): (config / name).unlink()
+    elif mode == 'config-discard':
+        if config_journal.exists(): configuration_transaction(); clear_journal(config_journal, config_files | {'state.json'})
+    elif mode == 'cleanup': prune()
+    elif mode == 'idle':
+        state = read_json(control / 'state.json', {})
+        if any(task.get('status') in ('queued', 'running') and task.get('id') != job for task in state.get('tasks', [])):
+            raise ValueError('another panel task is active')
+    elif mode == 'prepare':
+        if not re.fullmatch('[a-f0-9]{32}', job) or journal.exists(): raise ValueError('unfinished component transaction')
+        if staging.exists(): clear_journal(staging)
+        running = subprocess.run(['systemctl', 'is-active', '--quiet', 'oci-worker-gateway']).returncode == 0
+        baseline = marker()
+        endpoints = capture_health() if running else []
+        staging.mkdir(mode=0o700)
+        copy_file(current, staging / 'current.before')
+        if previous.exists(): copy_file(previous, staging / 'previous.before')
+        if info_path.exists(): copy_file(info_path, staging / 'info.before')
+        if marker() != baseline: raise ValueError('SSH recovery interrupted preparation')
+        write(staging / 'state.json', {'job': job, 'wasRunning': running, 'recovery': baseline, 'previous': previous.exists(), 'info': info_path.exists(), 'endpoints': endpoints})
+        os.replace(staging, journal)
+    elif mode == 'was-running':
+        sys.exit(0 if transaction()['wasRunning'] else 1)
+    elif mode == 'check-recovery':
+        if marker() != transaction()['recovery']: raise ValueError('SSH recovery interrupted update')
+    elif mode == 'swap':
+        transaction(); copy_file(previous, current); copy_file(journal / 'current.before', previous)
+    elif mode == 'previous':
+        transaction(); copy_file(journal / 'current.before', previous)
+    elif mode == 'restore':
+        if not journal.exists(): sys.exit(0)
+        value = transaction()
+        copy_file(journal / 'current.before', current)
+        if value['previous']: copy_file(journal / 'previous.before', previous)
+        elif previous.exists(): safe(previous).unlink()
+        if value['info']: copy_file(journal / 'info.before', info_path)
+        elif info_path.exists(): safe(info_path).unlink()
+    elif mode == 'finish':
+        if journal.exists(): transaction(); publish_info(job); clear_journal()
+        elif read_json(info_path, {}, 32768).get('lastTaskId') != job: raise ValueError('missing completed transaction')
+    elif mode == 'discard':
+        if journal.exists(): transaction(); clear_journal()
+    else: raise ValueError('unknown maintenance action')
+except Exception:
+    # Never echo configuration, credentials or subprocess output.
+    print('HTTPS 维护未完成：请检查文件权限、配置完整性、进行中的任务或 SSH 恢复状态。', file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+# Prefer the resources shipped by the running JAR. A missing/corrupt bundle must
+# never silently switch a release installation to unrelated network binaries.
+_gateway_fetch_asset() {
+    local asset="$1" output="$2" checksums="$3"
+    local groot="/opt/oci-worker/https-gateway" bundle="${OCIWORKER_GATEWAY_BUNDLE_DIR:-}" identifier expected part
+    [[ "$asset" =~ ^ociworker-gateway-linux-(amd64|arm64)$ ]] || die "HTTPS 组件架构无效"
+    if [ -z "$bundle" ] && { [ -e "$groot/control/runtime-bundle" ] || [ -L "$groot/control/runtime-bundle" ]; }; then
+        [ ! -L "$groot/control/runtime-bundle" ] || die "随包组件标记不能使用符号链接"
+        identifier="$(cat "$groot/control/runtime-bundle")"
+        [[ "$identifier" =~ ^[a-f0-9]{64}$ ]] || die "随包组件标记无效"
+        bundle="$groot/runtime-bundles/$identifier"
+    fi
+    if [ -n "$bundle" ]; then
+        identifier="${bundle##*/}"
+        [[ "$identifier" =~ ^[a-f0-9]{64}$ ]] && [ "$bundle" = "$groot/runtime-bundles/$identifier" ] || die "随包组件目录无效"
+        for part in "$groot/runtime-bundles" "$bundle" "$bundle/bundle.properties" "$bundle/$asset"; do
+            [ ! -L "$part" ] || die "随包组件不能使用符号链接"
+        done
+        [ -f "$bundle/bundle.properties" ] && [ -f "$bundle/$asset" ] || die "当前 JAR 的随包组件不完整"
+        [ "$(sha256sum "$bundle/bundle.properties" | cut -d' ' -f1)" = "$identifier" ] || die "随包组件清单校验失败"
+        expected="$(awk -F= -v key="$asset.sha256" '$1 == key {print $2}' "$bundle/bundle.properties")"
+        [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || die "随包组件校验值无效"
+        [ "$(sha256sum "$bundle/$asset" | cut -d' ' -f1)" = "$expected" ] || die "随包组件校验失败"
+        cp -- "$bundle/$asset" "$output" || die "随包组件复制失败"
+        printf '%s  %s\n' "$expected" "$asset" > "$checksums"
+    else
+        die "随包 HTTPS 组件尚未就绪，请更新并重启 OCI Worker 主程序后重试"
+    fi
+}
+
+cmd_gateway() (
+    set -euo pipefail
+    require_root gateway
+    local action=status job="" groot="/opt/oci-worker/https-gateway" baseline=""
+    [ $# -eq 0 ] || action="$1"
+    [ $# -lt 2 ] || job="$2"
+    [ $# -le 2 ] || die "用法：ociworker gateway install|status|apply <任务ID>|rollback|recover|upgrade|rollback-binary|cleanup"
+    case "$action" in install|status|apply|abort|rollback|recover|upgrade|rollback-binary|abort-upgrade|finish-upgrade|cleanup) ;; *) die "不支持的 HTTPS 操作" ;; esac
+    if [ "$action" = apply ] || [ "$action" = abort ]; then
+        [[ "$job" =~ ^[a-f0-9]{32}$ ]] || die "任务 ID 无效"
+    elif [[ "$action" =~ ^(rollback|upgrade|rollback-binary|abort-upgrade|finish-upgrade|cleanup)$ ]] && [ -n "$job" ]; then
+        [[ "$job" =~ ^[a-f0-9]{32}$ ]] || die "任务 ID 无效"
+    else
+        [ -z "$job" ] || die "此操作不接受任务参数"
+    fi
+    command -v systemctl >/dev/null || die "HTTPS 服务需要 systemd"
+    local part
+    for part in /opt /opt/oci-worker "$groot" "$groot/control" "$groot/config" "$groot/candidates" "$groot/bin"; do
+        [ ! -L "$part" ] || die "HTTPS 路径不能使用符号链接"
+    done
+    umask 077
+    mkdir -p "$groot/control"
+    chmod 700 "$groot/control"
+    if [ "$action" = status ]; then
+        if [ -x "$groot/bin/ociworker-gateway" ]; then echo "HTTPS 组件：已安装"; else echo "HTTPS 组件：未安装"; fi
+        if systemctl is-active --quiet oci-worker-gateway; then echo "HTTPS 服务：运行中"; else echo "HTTPS 服务：未运行"; fi
+        [ ! -f "$groot/control/recovery.flag" ] || echo "恢复模式：已启用，原端口可访问"
+        echo "恢复访问：ociworker gateway recover"
+        echo "回退配置：ociworker gateway rollback"
+        echo "更新组件：ociworker gateway upgrade"
+        echo "回退组件：ociworker gateway rollback-binary"
+        echo "清理历史材料：ociworker gateway cleanup"
+        exit 0
+    fi
+    command -v python3 >/dev/null || die "HTTPS 管理需要 python3，请先安装 Python 3"
+    command -v flock >/dev/null || die "缺少 flock，请安装 util-linux"
+    for part in "$groot/control/recovery.flag" "$groot/control/operation.lock" "$groot/control/recovery.lock"; do
+        [ ! -L "$part" ] || die "HTTPS 控制文件不能使用符号链接"
+    done
+    exec 8>"$groot/control/recovery.lock"
+    if [ "$action" = recover ]; then
+        # Recovery never waits for the operation/download lock. The short gate serializes service starts.
+        flock -w 30 8 || die "HTTPS 正在切换服务，请重试恢复指令"
+        _gateway_maintenance_files recover
+        systemctl disable --now oci-worker-gateway >/dev/null 2>&1 || true
+        if systemctl is-active --quiet oci-worker-gateway; then die "原端口限制已解除，但 HTTPS 服务未停止；请检查 systemctl status oci-worker-gateway"; fi
+        ok "已停用 HTTPS 入口并解除应用层直连限制（面板数秒内识别）。如有外部防火墙，请通过 SSH 本地转发登录。"
+        exit 0
+    fi
+    exec 9>"$groot/control/operation.lock"
+    flock -w 15 9 || die "另一个 HTTPS 操作正在执行，请稍后重试"
+    baseline="$(_gateway_maintenance_files task-marker "$job")"
+    if [ "$action" = cleanup ]; then
+        _gateway_maintenance_files cleanup "$job"
+        ok "历史材料已检查；保留当前、回退、进行中任务及最近 24 小时的配置"
+        exit 0
+    fi
+    _gateway_component_abort() {
+        [ -d "$groot/bin/.component-transaction" ] || return 0
+        if [ -z "$job" ]; then job="$(_gateway_maintenance_files pending)" || return 1; fi
+        if _gateway_maintenance_files committed "$job"; then _gateway_maintenance_files discard "$job"; return; fi
+        flock -w 30 8 || return 1
+        local restore_running=false
+        if _gateway_maintenance_files was-running "$job" && _gateway_maintenance_files check-recovery "$job"; then restore_running=true; fi
+        _gateway_maintenance_files restore "$job" || return 1
+        if [ "$restore_running" = true ]; then
+            systemctl restart oci-worker-gateway >/dev/null 2>&1 || return 1
+        else
+            systemctl stop oci-worker-gateway >/dev/null 2>&1 || return 1
+        fi
+        _gateway_maintenance_files discard "$job" || return 1
+        flock -u 8
+    }
+    if [ "$action" = abort-upgrade ]; then
+        _gateway_component_abort || die "组件恢复未完成，请执行 ociworker gateway recover"
+        exit 0
+    fi
+    if [ "$action" = finish-upgrade ]; then
+        flock -w 30 8 || die "HTTPS 正在恢复，请稍后重试"
+        if [ -d "$groot/bin/.component-transaction" ] && ! _gateway_maintenance_files committed "$job"; then _gateway_maintenance_files check-recovery "$job"; fi
+        _gateway_maintenance_files finish "$job"
+        exit 0
+    fi
+    if [ "$action" = upgrade ] || [ "$action" = rollback-binary ]; then
+        [ -x "$groot/bin/ociworker-gateway" ] || die "请先启用 HTTPS 或安装组件"
+        local automatic_finish=false download="" checksums="" arch asset expected actual required modules
+        if [ -z "$job" ]; then job="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"; automatic_finish=true; fi
+        _gateway_maintenance_files idle "$job" || die "其他 HTTPS 任务正在执行"
+        _gateway_maintenance_files config-ready || die "配置事务尚未恢复完成，请先执行 ociworker gateway recover"
+        [ -z "$(_gateway_maintenance_files pending)" ] || die "上次组件事务尚未结束，请执行 ociworker gateway abort-upgrade 恢复后再试"
+        trap 'result=$?; if [ "$action" = upgrade ]; then rm -f "$download" "$checksums"; fi; if [ "$result" -ne 0 ]; then _gateway_component_abort || echo "组件自动恢复未完成，请执行 ociworker gateway recover，然后执行 ociworker gateway abort-upgrade" >&2; fi' EXIT
+        if [ "$action" = upgrade ]; then
+            case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) die "仅支持 Linux amd64/arm64" ;; esac
+            asset="ociworker-gateway-linux-$arch"
+            download="$(mktemp "$groot/bin/.download.XXXXXXXX")"
+            checksums="$(mktemp "$groot/bin/.checksums.XXXXXXXX")"
+            _gateway_fetch_asset "$asset" "$download" "$checksums"
+            expected="$(awk -v name="$asset" '$2 == name {print $1}' "$checksums")"
+            [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || die "组件校验清单无效"
+            actual="$(sha256sum "$download" | cut -d' ' -f1)"
+            [ "$actual" = "$expected" ] || die "组件校验不符，原组件未改变"
+            if [ "$actual" = "$(sha256sum "$groot/bin/ociworker-gateway" | cut -d' ' -f1)" ]; then
+                [ "$baseline" = "$(_gateway_maintenance_files marker)" ] || die "SSH 恢复已执行，组件更新停止"
+                _gateway_maintenance_files info "$job"
+                ok "当前已是发行的组件版本"
+                exit 0
+            fi
+            chmod 750 "$download"; chown root:oci-worker-gateway "$download"
+        else
+            download="$groot/bin/ociworker-gateway.previous"
+            [ -x "$download" ] && [ ! -L "$download" ] || die "没有可回退的组件版本"
+            # The retained previous binary is not a temporary download.
+            trap 'result=$?; if [ "$result" -ne 0 ]; then _gateway_component_abort || echo "组件自动恢复未完成，请执行 ociworker gateway recover，然后执行 ociworker gateway abort-upgrade" >&2; fi' EXIT
+        fi
+        modules="$("$download" list-modules 2>/dev/null)" || die "无法验证组件模块"
+        for required in http.handlers.waf http.handlers.ociworker_guard caddy.logging.writers.ociworker_safe dns.providers.cloudflare dns.providers.alidns dns.providers.tencentcloud; do
+            printf '%s\n' "$modules" | grep -Fx "$required" >/dev/null || die "组件缺少必要模块，原组件未改变"
+        done
+        if [ -f "$groot/config/active.json" ]; then
+            runuser -u oci-worker-gateway -- "$download" validate --config "$groot/config/active.json" >/dev/null 2>&1 || die "新组件不兼容当前配置，原组件未改变"
+        fi
+        [ "$baseline" = "$(_gateway_maintenance_files marker)" ] || die "SSH 恢复已执行，组件更新停止"
+        _gateway_maintenance_files prepare "$job"
+        flock -w 30 8 || die "HTTPS 正在恢复，请稍后重试"
+        [ "$baseline" = "$(_gateway_maintenance_files marker)" ] || die "SSH 恢复已执行，组件更新停止"
+        _gateway_maintenance_files check-recovery "$job"
+        if [ "$action" = upgrade ]; then
+            _gateway_maintenance_files previous "$job"
+            mv -f "$download" "$groot/bin/ociworker-gateway"
+            download=""
+        else
+            _gateway_maintenance_files swap "$job"
+        fi
+        _gateway_maintenance_files check-recovery "$job"
+        if _gateway_maintenance_files was-running "$job"; then
+            systemctl restart oci-worker-gateway >/dev/null 2>&1 || die "新组件启动失败，正在恢复旧版"
+            systemctl is-active --quiet oci-worker-gateway || die "新组件未运行，正在恢复旧版"
+        fi
+        _gateway_maintenance_files check-recovery "$job"
+        flock -u 8
+        _gateway_maintenance_files health "$job" || die "新组件未通过本机 TLS 检查，正在恢复旧版"
+        flock -w 30 8 || die "HTTPS 正在恢复，请稍后重试"
+        _gateway_maintenance_files check-recovery "$job"
+        if [ "$automatic_finish" = true ]; then _gateway_maintenance_files finish "$job"; fi
+        ok "组件已通过本机 TLS 核验；网页发起的任务将继续同步结果"
+        exit 0
+    fi
+    if [ "$action" = install ]; then
+        require_installed
+        command -v sha256sum >/dev/null || die "缺少 sha256sum"
+        _gateway_maintenance_files config-ready
+        if ! getent passwd oci-worker-gateway >/dev/null; then
+            useradd --system --user-group --no-create-home --home-dir "$groot" --shell /usr/sbin/nologin oci-worker-gateway
+        fi
+        local dir
+        for dir in "$groot" "$groot/bin" "$groot/config" "$groot/candidates"; do
+            [ ! -L "$dir" ] || die "HTTPS 目录无效"
+            install -d -o root -g oci-worker-gateway -m 750 "$dir"
+        done
+        for dir in "$groot/storage" "$groot/run" "$groot/logs"; do
+            [ ! -L "$dir" ] || die "HTTPS 目录无效"
+            install -d -o oci-worker-gateway -g oci-worker-gateway -m 700 "$dir"
+        done
+        local arch asset download checksums expected actual
+        case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) die "仅支持 Linux amd64/arm64" ;; esac
+        asset="ociworker-gateway-linux-$arch"
+        if [ ! -x "$groot/bin/ociworker-gateway" ]; then
+            download="$(mktemp "$groot/bin/.download.XXXXXXXX")"
+            checksums="$(mktemp "$groot/bin/.checksums.XXXXXXXX")"
+            trap 'rm -f "$download" "$checksums"' EXIT
+            _gateway_fetch_asset "$asset" "$download" "$checksums"
+            expected="$(awk -v name="$asset" '$2 == name {print $1}' "$checksums")"
+            [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || die "HTTPS 校验文件格式无效"
+            actual="$(sha256sum "$download" | cut -d' ' -f1)"
+            [ "$actual" = "$expected" ] || die "HTTPS 组件校验失败，未安装；发布更新期间请稍后重试"
+            chmod 750 "$download"
+            chown root:oci-worker-gateway "$download"
+            "$download" list-modules 2>/dev/null | grep -Fx 'http.handlers.waf' >/dev/null || die "组件缺少 WAF 支持"
+            mv -f "$download" "$groot/bin/ociworker-gateway"
+        fi
+        local unit
+        unit="$(mktemp /etc/systemd/system/.oci-worker-gateway.XXXXXXXX)"
+        cat > "$unit" <<EOF
+[Unit]
+Description=OCIworker HTTPS and access protection
+After=network-online.target oci-worker.service
+Wants=network-online.target
+ConditionPathExists=$groot/config/active.json
+
+[Service]
+Type=simple
+User=oci-worker-gateway
+Group=oci-worker-gateway
+WorkingDirectory=$groot
+Environment=XDG_DATA_HOME=$groot/storage
+Environment=XDG_CONFIG_HOME=$groot/storage
+ExecStart=$groot/bin/ociworker-gateway run --config $groot/config/active.json
+ExecReload=$groot/bin/ociworker-gateway reload --config $groot/config/active.json --address unix/$groot/run/admin.sock
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=/opt/oci-worker/keys -/opt/oci-worker/application.yml -/opt/oci-worker/data -/opt/oci-worker/backups $groot/control
+ReadWritePaths=$groot/storage $groot/run $groot/logs
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 644 "$unit"
+        mv -f "$unit" /etc/systemd/system/oci-worker-gateway.service
+        systemctl daemon-reload
+        _gateway_maintenance_files info
+        ok "HTTPS 组件已安装，请在域名与 HTTPS 模块保存并应用配置。云安全列表与防火墙需允许所选 HTTPS 端口，HTTP 验证还需 80 端口。"
+        exit 0
+    fi
+    [ -x "$groot/bin/ociworker-gateway" ] || die "请先执行 ociworker gateway install"
+    [ -z "$(_gateway_maintenance_files pending)" ] || die "组件事务尚未结束，请执行 ociworker gateway abort-upgrade 后再试"
+    local current="$groot/config/active.json" previous="$groot/config/previous.json"
+    local current_id="$groot/config/active.id" previous_id="$groot/config/previous.id"
+    for part in "$current" "$previous" "$current_id" "$previous_id"; do
+        [ ! -L "$part" ] || die "配置文件不能是符号链接"
+    done
+    _gateway_load() {
+        # A pending panel rollback must never undo a later explicit SSH recovery.
+        if [ "$action" = rollback ] && [ -n "$job" ] && [ -f "$groot/control/recovery.flag" ]; then
+            systemctl stop oci-worker-gateway >/dev/null 2>&1 || true
+            return 0
+        fi
+        if systemctl is-active --quiet oci-worker-gateway; then
+            "$groot/bin/ociworker-gateway" reload --config "$current" --address "unix/$groot/run/admin.sock" >/dev/null 2>&1
+        else
+            systemctl start oci-worker-gateway >/dev/null 2>&1
+        fi
+    }
+    _gateway_copy() {
+        install -o root -g oci-worker-gateway -m 640 "$1" "$2.next"
+        mv -f "$2.next" "$2"
+    }
+    _gateway_abort() {
+        flock -w 30 8 || return 1
+        [ -d "$groot/config/.transaction" ] || return 0
+        if _gateway_maintenance_files config-committed "$job"; then
+            _gateway_maintenance_files config-discard "$job"
+            return
+        fi
+        local restore_running=false
+        if _gateway_maintenance_files config-was-running "$job"; then restore_running=true; fi
+        _gateway_maintenance_files config-restore "$job" || return 1
+        if [ "$restore_running" = true ] && [ -f "$current" ] && [ ! -f "$groot/control/recovery.flag" ]; then
+            _gateway_load || return 1
+        else
+            systemctl stop oci-worker-gateway >/dev/null 2>&1 || return 1
+        fi
+        _gateway_maintenance_files config-discard "$job"
+    }
+    if [ "$action" = abort ]; then
+        _gateway_abort || die "任务恢复失败，请执行 ociworker gateway recover"
+        ok "未通过检查的候选配置已撤销，原回退记录保留"
+        exit 0
+    fi
+    if [ "$action" = apply ]; then
+        local candidate="$groot/candidates/$job"
+        [ -d "$candidate" ] && [ ! -L "$candidate" ] && [ -f "$candidate/gateway.json" ] || die "候选配置不存在"
+        [ -z "$(find "$candidate" -type l -print -quit)" ] || die "候选配置不能包含符号链接"
+        chown root:oci-worker-gateway "$candidate"
+        chmod 750 "$candidate"
+        find "$candidate" -maxdepth 1 -type f -exec chown root:oci-worker-gateway {} + -exec chmod 640 {} +
+        [ ! -L "$groot/storage" ] && [ -z "$(find "$groot/storage" -type l -print -quit)" ] || die "证书存储不能包含符号链接"
+        chown -R oci-worker-gateway:oci-worker-gateway "$groot/storage"
+        # Validate as the actual service account so unreadable keys fail before applying.
+        runuser -u oci-worker-gateway -- "$groot/bin/ociworker-gateway" validate --config "$candidate/gateway.json" >/dev/null 2>&1 || die "候选配置校验失败，现有入口未改变"
+        flock -w 30 8 || die "HTTPS 正在恢复，请稍后重试"
+        [ "$baseline" = "$(_gateway_maintenance_files marker)" ] || die "SSH 恢复已执行，本次应用停止"
+        _gateway_maintenance_files idle "$job"
+        _gateway_maintenance_files config-prepare-apply "$job"
+        trap 'result=$?; if [ "$result" -ne 0 ]; then _gateway_abort || echo "配置恢复未完成，请执行 ociworker gateway recover" >&2; fi' EXIT
+        rm -f "$groot/control/recovery.flag"
+        if [ -f "$current" ] && [ -f "$current_id" ]; then
+            _gateway_copy "$current" "$previous"
+            _gateway_copy "$current_id" "$previous_id"
+        else
+            rm -f "$previous" "$previous_id"
+        fi
+        # Record ownership before replacing the active config, allowing restart reconciliation.
+        printf '%s\n' "$job" > "$current_id.next"
+        chown root:oci-worker-gateway "$current_id.next"
+        chmod 640 "$current_id.next"
+        mv -f "$current_id.next" "$current_id"
+        _gateway_copy "$candidate/gateway.json" "$current"
+        if ! _gateway_load; then
+            _gateway_abort || die "应用与恢复均失败，请执行 ociworker gateway recover"
+            die "应用失败，已恢复此前入口"
+        fi
+        systemctl enable oci-worker-gateway >/dev/null 2>&1
+        ok "候选配置已加载，证书生效由后台继续检查"
+        exit 0
+    fi
+    if [ "$action" = rollback ]; then
+        flock -w 30 8 || die "HTTPS 正在恢复，请稍后重试"
+        if [ -n "$job" ] && [ "$job" = "$(_gateway_maintenance_files config-pending)" ]; then
+            _gateway_abort || die "回退事务恢复失败，请执行 ociworker gateway recover"
+            exit 0
+        fi
+        local manual_rollback=false
+        if [ -z "$job" ]; then job="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"; manual_rollback=true; fi
+        _gateway_maintenance_files idle "$job"
+        if [ ! -f "$previous" ] || [ ! -f "$previous_id" ]; then
+            die "没有上一份配置；停用 HTTPS 请执行 ociworker gateway recover"
+        fi
+        runuser -u oci-worker-gateway -- "$groot/bin/ociworker-gateway" validate --config "$previous" >/dev/null 2>&1 || die "旧配置校验失败，请执行 ociworker gateway recover"
+        _gateway_maintenance_files config-prepare-rollback "$job"
+        trap 'result=$?; if [ "$result" -ne 0 ]; then _gateway_abort || echo "配置恢复未完成，请执行 ociworker gateway recover" >&2; fi' EXIT
+        _gateway_copy "$previous_id" "$current_id"
+        _gateway_copy "$previous" "$current"
+        if ! _gateway_load; then
+            _gateway_abort || die "回退与恢复均失败，请执行 ociworker gateway recover"
+            die "回退失败，已保留原配置；需要恢复请执行 ociworker gateway recover"
+        fi
+        _gateway_copy "$groot/config/.transaction/active.json" "$previous"
+        _gateway_copy "$groot/config/.transaction/active.id" "$previous_id"
+        if [ "$manual_rollback" = true ]; then
+            _gateway_maintenance_files recover
+            _gateway_maintenance_files config-discard "$job"
+        fi
+        ok "已回退 HTTPS 配置；可通过 ociworker gateway recover 恢复原端口访问"
+    fi
+)
 
 cmd_uninstall() {
     require_root uninstall
@@ -803,13 +1599,14 @@ cmd_uninstall() {
     info "停止服务..."
     systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
     systemctl stop "${LEGACY_TERMINAL_SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable --now oci-worker-gateway 2>/dev/null || true
     systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
     systemctl disable "${LEGACY_TERMINAL_SERVICE_NAME}" 2>/dev/null || true
-    rm -f "${SERVICE_FILE}" "${LEGACY_TERMINAL_SERVICE_FILE}"
+    rm -f "${SERVICE_FILE}" "${LEGACY_TERMINAL_SERVICE_FILE}" /etc/systemd/system/oci-worker-gateway.service
     rm -f "${LEGACY_TERMINAL_BIN}"
     systemctl daemon-reload
 
-    if [ "$(ask_yes_no "删除 ${INSTALL_DIR}（含 application.yml、keys、JAR、备份）？" "N")" = "y" ]; then
+    if [ "$(ask_yes_no "删除 ${INSTALL_DIR}（含 application.yml、keys、JAR、备份、HTTPS 证书）？" "N")" = "y" ]; then
         rm -rf "${INSTALL_DIR}"
         ok "已删除 ${INSTALL_DIR}"
     else
@@ -855,6 +1652,8 @@ menu() {
   7) 备份            8) 恢复
   9) 升级到最新版   10) 版本信息
  11) 清除Tg绑定    12) 卸载
+ 13) 解除备份验证锁定
+ 14) HTTPS 服务状态  15) 恢复原端口访问（停用 HTTPS）
   0) 退出
 EOF
         printf "> " >&2
@@ -875,6 +1674,9 @@ EOF
             10) cmd_version        || true ;;
             11) cmd_tg_clean       || true ;;
             12) cmd_uninstall      || true ;;
+            13) cmd_backup_unlock  || true ;;
+            14) cmd_gateway status || true ;;
+            15) cmd_gateway recover || true ;;
             0|q|Q|exit) info "再见"; break ;;
             *) warn "无效选项" ;;
         esac
@@ -905,6 +1707,8 @@ main() {
         backup)        cmd_backup ;;
         restore)       cmd_restore "$@" ;;
         tg-clean)      cmd_tg_clean ;;
+        backup-unlock) cmd_backup_unlock ;;
+        gateway)       cmd_gateway "$@" ;;
         uninstall)     cmd_uninstall ;;
         version)       cmd_version ;;
         menu)          menu ;;
