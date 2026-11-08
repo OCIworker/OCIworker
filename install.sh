@@ -52,8 +52,9 @@ readonly TMP_DIR
 UPGRADE_LOCK_FALLBACK=""
 
 # JDK 21 (Adoptium Temurin)
-readonly JDK_VERSION_URLENC="21.0.7%2B6"
-readonly JDK_VERSION_FILE="21.0.7_6"
+readonly JDK_VERSION="21.0.12.1+1"
+readonly JDK_VERSION_URLENC="21.0.12.1%2B1"
+readonly JDK_VERSION_FILE="21.0.12.1_1"
 readonly JDK_INSTALL_BASE="/opt/java"
 
 # -----------------------------------------------------------------------------
@@ -448,45 +449,204 @@ detect_mode() {
 # JDK 21
 # -----------------------------------------------------------------------------
 java_version_line() {
-    # Capture full java -version (avoids SIGPIPE on `head` under pipefail).
-    if ! command -v java >/dev/null 2>&1; then
-        return 1
-    fi
-    local v
-    v="$(java -version 2>&1 || true)"
-    printf "%s\n" "${v}" | sed -n '1p'
+    local executable="${1:-java}" output
+    command -v "${executable}" >/dev/null 2>&1 || return 1
+    output="$("${executable}" -version 2>&1)" || return 1
+    printf '%s\n' "${output}" | sed -n '1p'
 }
 
-java_is_21() {
-    local line
-    line="$(java_version_line 2>/dev/null || true)"
-    [ -n "${line}" ] || return 1
-    printf "%s" "${line}" | grep -Eq '"21(\.|")'
+java_is_supported() {
+    local version
+    version="$(java_version_line "$1" | sed -n 's/.*"\([^"]*\)".*/\1/p')"
+    [[ "${version}" =~ ^21\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+    [ "$(printf '%s\n' '21.0.12.1' "${version}" | sort -V | head -n 1)" = '21.0.12.1' ]
+}
+
+patch_java_blocklist() {
+    local executable="$1" settings java_home target candidate required
+    settings="$("${executable}" -XshowSettings:properties -version 2>&1)" || die "无法检查 Java 运行时：${executable}"
+    java_home="$(printf '%s\n' "${settings}" | sed -n 's/^[[:space:]]*java.home = //p' | tr -d '\r')"
+    [ -n "${java_home}" ] && [ -d "${java_home}/lib/security" ] || die "无法确定 Java 证书黑名单目录"
+    target="${java_home}/lib/security/blocked.certs"
+    # OS packages may deliberately symlink this file; update its resolved target.
+    target="$(readlink -f "${target}")" || die "无法解析 Java 证书黑名单路径"
+    required="${TMP_DIR}/blocked.certs.required"
+    cat > "${required}" <<'OCI_BLOCKED_CERTS'
+Algorithm=SHA-256
+0164D7CEAE5BB909C272AF151FF44B1177AE9B47D9424B94F1D9558C30934D19
+03DB9E5E79FE6117177F81C11595AF598CB176AF766290DBCEB2C318B32E39A2
+08C396C006A21055D00826A5781A5CCFCE2C8D053AB3C197637A4A7A5BB9A650
+10E7E5BFDB55CFB78D0C21366654046182087A1960C079682513795665AA0C6B
+14E6D2764A4B06701C6CBC376A253775F79C782FBCB6C0EE6F99DE4BA1024ADD
+169A0523C5E071AA4E298286DBD4EE0E40C8C06ABB6B0C077D132F001FA19240
+1C5E6985ACC09221DBD1A4B7BBC6D3A8C3F8540D19F20763A9537FDD42B4FFE7
+1F6BF8A3F2399AF7FD04516C2719C566CBAD51F412738F66D0457E1E6BDE6F2D
+21182E577E5106B669322ABE6086FFF6B101E8C83FD2D01DC32D854961AAC832
+2A464E4113141352C7962FBD1706ED4B88533EF24D7BBA6CCC5D797FD202F1C4
+31C8FD37DB9B56E708B03D1F01848B068C6DA66F36FB5D82C008C6040FA3E133
+33C1BCDC6DA52DF950B3B14121127DA1955F7F31F828497A7608986EB2DDCC09
+37E866582D43C35D7C17D47794B974F291B3047B868DC123382477F7A08AEFA8
+3946901F46B0071E90D78279E82FABABCA177231A704BE72C5B0E8918566EA66
+3B88E4B77FC53C45CA216700E39FC0EA7621A0A40FCB268215082E35D2BD5829
+3C5456D4219BA2372273867FAC9A07104600391E96C7FDCDE3B4420C0F1F69BF
+3E11CF90719F6FB44D94EAC9A156B89BEBE7B8598F28EC58913F2BFCAF91D0C0
+423279423B9FC8CB06F1BB7C3B247522B948D5F18939F378ECC901126DE40BFB
+42C4ACCD12C4F59597925E1A08A7A90102608543809308D50EC427E118BA1493
+432EC25F0D28DE9006D97BF752F17BBB2CD41F669933FCB072D9A1148D0261F3
+450F1B421BB05C8609854884559C323319619E8B06B001EA2DCBB74A23AA3BE2
+45A883F349AEDFD5F3A649B5498FFB121712BA8B448F3F2A91DBC5A766FCDDBE
+4B2460A466F95FD40113BCDCCA2CEB29B3B093921DE45474DA7DF48874C630B1
+4CBBF8256BC9888A8007B2F386940A2E394378B0D903CBB3863C5A6394B889CE
+4DED6F955374E40B8558A611A9719B2AB69AA6852AC50966EDC4B07DE4D4277C
+4FEE0163686ECBD65DB968E7494F55D84B25486D438E9DE558D629D28CD4D176
+50E71B08B9AC407B93D50EE90100CB6B6B41C956DC7AA86C5BAA38AE713CFD6A
+535D04DFCE027C70BD5F8A9E0AD4F218E9AFDCF5BBCF9B6DE0D81E148E2E3172
+558EC6CA13DA9B800FEDC9ACC3C18CA98BB19768F1309B60B5BB89793B3481CB
+568FAF38D9F155F624838E2181B1CEB4D8459305EE652B0F810C97C3611BFE19
+579480AEA166290BD3C643589E795FC0D0E54E86505D180F1DFF99EFD3199512
+585CFE6B7436CBD4E732763A2137D7F49599BA9B1790E688FCEC799C58EB84A6
+59CC5FD35A737B84682EDA26AD23F5ADE8AA847D5BEB3B38AB6CD62347925A66
+5D8FC3ECDDB4DDB243AEE5C306BCFDE670ADF2D66B193DD3AA2D6B2FB91869BE
+5E83124D68D24E8E177E306DF643D5EA99C5A94D6FC34B072F7544A1CABB7C7B
+5F1DED4DD590AF74631290CF073B122A2AAC6A1FA479778A0BD43579BD832699
+62B7F9868263F72F6911FC78CEAF72C1979158B7368BF648683BB2AA39B02E72
+71CB00749B9130FB2707A2664BFF958D0FCC8E161D9674C7450BA0FC2BEAF9D3
+7485B51C0ED192878FA1D2F948FB529AE1842CC5086C4B67F7BE5B2039DE9489
+75D8853BE99C87678E6C7BF9F684B31454D81DEB1C7F37B9FBC026A268337536
+76A45A496031E4DD2D7ED23E8F6FF97DBDEA980BAAC8B0BA94D7EDB551348645
+7BA62FEC54E9D040556FCA70A6A88F03761C178FA1F7CB8390A73076849F55A2
+84112972B8E59D14560AE7E7119654474AAD119990CF3722BFC1E3B91615E1FD
+8A1BD21661C60015065212CC98B1ABB50DFD14C872A208E66BAE890F25C448AF
+8F580C6E34CEE7EE57B93BA9C0AC5FAEDD7BF3085F5EE9C6C0175A2555B111D0
+8FED925362F62FFF90DD835BE6ADC32B02DEC8DF5E82D83E512F1C977D066E82
+912A48745BFF2F14D1798B27858613DE1C0EB03C2BDE630AFD0DDD5251E1EBE1
+98B896625C0C230ADEEC3EB2CF6AAD5001ECF9156A68644E82374CE5833BC25B
+9E39DE2881273ACC225A149C72BA3E0F51424963669AB633EE1DC7DF5DB067B4
+9E7617035CFF537C837E078A7CDC7FD9EB77BCE7DDF3DC6DBD5C50AAFC1F1FA7
+9ED8F9B0E8E42A1656B8E1DD18F42BA42DC06FE52686173BA2FC70E756F207DC
+9FADCE80D62A959F9930D748488C1E22E821F4E1E4A43584B848C2FC11E04D77
+A0ED2032C5249EE1A653F1F88005D9E779E385DF533B5C521137CEE5176CD7FC
+A104B1314DF8E02F7DE27DDC287D0961D6E6824AD4DAFC3D11064F24C1B653D5
+A4328E058C867AF9CA8D468C388B72C250CE84BDB6BAF7F8C47C9A0B1CB35EEC
+A496E23AC0CAB8155FC9B117B97EAE368EFCBB9041AEC8804D5A308D2D01C2D8
+A4B72DBD37256324B557B9176F8CBA4310DDFFBCC4609977E2463F3504A716C8
+A61FE79B019062DD3C6420BC20EAF64702CC1063C546A084DD0A0BCB915A14A9
+A686FEE577C88AB664D0787ECDFFF035F4806F3DE418DC9E4D516324FFF02083
+A90132CEA1D4F7185E4F688EFFD16F6AC14DFD78356A807599A5DABBEEF3333E
+AB7292F82267333031F512379FDBADA949DFA49D3C046CC8FA7F34117C342986
+B7121039CAF13E03E52507F42DB56FA802FF119DA7591ABA8A2E842133DB7C9C
+B75104427B6A5BE55033AF50DC0FE3102181BE130E761D487A4E8178C93317DD
+B8686723E415534BC0DBD16326F9486F85B0B0799BF6639334E61DAAE67F36CD
+C0D1F42B9F4BF7ACC045B7BB5D4805E10737F67B6310CE505248D543D0D5FE07
+C5F1531C6331659C75A6411A088A65DAD7518FD91F57B64537A651B6DCD76AE0
+C65CBC98295549BA940494A6214B9706E7115E64F3FE269412C5B48AEACB2222
+C93F7B1EEF27CFD0F227DFE3F057D63833533890B7230B1821A424BD40848E33
+CB6E15165AC802E9B3F993F16C25D41F4E81C21EBDE71AE1B012AC00BF9C7C3F
+CD740652E552D93EE64D7C9D1CC25228E466895889CEE25A11C962AB09906978
+D0156949F1381943442C6974E9B5B49EF441BB799EF20477B90A89C3F33620CE
+D151962D954970501C60079258EBCFA38502E0A9F03CD640322B08C0A3117FE5
+D24566BF315F4E597D6E381C87119FB4198F5E9E2607F5F4AB362EF7E2E7672F
+D3A936E1A7775A45217C8296A1F22AC5631DCDEC45594099E78EEEBBEDCBA967
+D6CEAE5D9E047FAF7D797858D229AC991AD44316D1E2A37A21926D763153593A
+D8A50FA0068E9558E6C3BEE18CDB03B7EECBC3C56C1B2336B98AEE11644994B8
+DF21016B00FC54F9FE3BC8B039911BB216E9162FAD2FD14D990AB96E951B49BE
+E0E740E4B0F8B3548181FF75B5372FAF4C70B99EC995D694ED0FB91B03FF8D21
+E7568FE6E12331F4FD7DE61DA4C7559D0F8EB192A218D4741A3BA75184333838
+EC30C9C3065A06BB07DC5B1C6B497F370C1CA65C0F30C08E042BA6BCECC78F2C
+EF34030C01B13BF42B534072DCC3C75B13C009DC9241119ADA39E2C15E2AFD2E
+F5B6F88F75D391A4B1EB336F9E201239FB6B1377DB8CFA7B84736216E5AFFFD7
+FBB12938ABD86C125796EDF4162D291028890A7D6C0C1CCA75FD4B95EBFA7A1A
+FC02FD48DB92D4DCE6F11679D38354CF750CFC7F584A520EB90BDE80E241F2BD
+FD9D5C2DBBD4995AB69B8D50C439D9527B00529199C2FD01B2174EB58F07021F
+FDEDB5BDFCB67411513A61AEE5CB5B5D7C52AF06028EFC996CC1B05B1D6CEA2B
+OCI_BLOCKED_CERTS
+    if [ -f "${target}" ]; then
+        grep -qx 'Algorithm=SHA-256' "${target}" || die "Java 黑名单不是 SHA-256 格式，已保留原文件，请人工合并"
+        if awk 'NR==FNR {if ($0 !~ /^Algorithm=/) required[$0]=1; next}
+            {line=$0; sub(/=.*/, "", line); delete required[line]}
+            END {for (key in required) exit 1}' "${required}" "${target}"; then
+            ok "Java 证书黑名单已包含 CVE-2026-91403 修复：${target}"
+            return
+        fi
+    fi
+    candidate="$(mktemp "${target}.ociworker.XXXXXXXX")" || die "无法写入 Java 证书黑名单，请以系统服务权限执行运行时维护"
+    if [ -f "${target}" ]; then
+        cp -p "${target}" "${candidate}" || die "证书黑名单复制失败"
+        if [ ! -e "${target}.before-cve-2026-91403" ]; then
+            cp -p "${target}" "${target}.before-cve-2026-91403" || die "证书黑名单备份失败"
+        fi
+    else
+        printf 'Algorithm=SHA-256\n' > "${candidate}"
+        chmod 644 "${candidate}"
+    fi
+    # Append the upstream entries; preserve every existing/custom Java property.
+    printf '\n' >> "${candidate}"
+    sed '1d' "${required}" >> "${candidate}"
+    mv -f "${candidate}" "${target}" || die "证书黑名单替换失败"
+    ok "已合并 CVE-2026-91403 证书黑名单；重启 Java 服务后生效"
+}
+
+patch_service_java() {
+    local service_exec service_java
+    command -v systemctl >/dev/null 2>&1 || return 0
+    service_exec="$(systemctl show "${SERVICE_NAME}" -p ExecStart --value 2>/dev/null || true)"
+    service_java="$(printf '%s\n' "${service_exec}" | sed -n 's/.*path=\([^ ;]*\).*/\1/p')"
+    if [ -n "${service_java}" ] && [ "${service_java}" != /usr/local/bin/java ]; then
+        case "${service_java}" in
+            */java) patch_java_blocklist "${service_java}" ;;
+            *) die "服务使用自定义启动器，请人工检查实际 JVM 后再升级：${service_java}" ;;
+        esac
+    fi
 }
 
 install_jdk21() {
-    if java_is_21; then
-        ok "JDK 21 已安装：$(java_version_line)"
-        return 0
+    local executable=/usr/local/bin/java
+    if [ ! -x "${executable}" ]; then
+        executable="$(command -v java || true)"
     fi
-    info "安装 JDK 21 (Adoptium Temurin)..."
+    if [ -n "${executable}" ] && java_is_supported "${executable}"; then
+        if [ "${executable}" != /usr/local/bin/java ]; then
+            ln -sf "$(readlink -f "${executable}")" /usr/local/bin/java
+        fi
+        patch_java_blocklist /usr/local/bin/java
+        patch_service_java
+        ok "Java 运行时及证书黑名单已检查：$(java_version_line /usr/local/bin/java)"
+        return
+    fi
+    info "维护 Java 21 (Adoptium Temurin ${JDK_VERSION})..."
     ensure_cmd curl
     ensure_cmd tar
-    local jdk_arch tmp
+    ensure_cmd sha256sum
+    local jdk_arch tmp digest jdk_dir staging
     jdk_arch="$(detect_jdk_arch)"
     tmp="${TMP_DIR}/jdk21.tar.gz"
-    if ! curl -fSL --retry 3 --retry-delay 5 --connect-timeout 15 \
+    case "${jdk_arch}" in
+        aarch64) digest="14be1f35ebdbd1f6e8d57eb911a3ffb74d6d9aa255abc5daf2b1302002cf2cf2" ;;
+        x64) digest="2413149700df0f7d440500a84a8f764c535f21e5a5e87d38328b64eec2c5b500" ;;
+    esac
+    if ! curl -fSL --retry 3 --retry-delay 5 --connect-timeout 15 --max-time 600 \
             -o "${tmp}" \
             "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-${JDK_VERSION_URLENC}/OpenJDK21U-jre_${jdk_arch}_linux_hotspot_${JDK_VERSION_FILE}.tar.gz"; then
-        die "JDK 下载失败，请检查网络（GitHub 是否可访问）"
+        die "Java 下载失败，已保留原运行时"
     fi
-    mkdir -p "${JDK_INSTALL_BASE}"
-    tar -xzf "${tmp}" -C "${JDK_INSTALL_BASE}" || die "JDK 解压失败"
-    local jdk_dir
-    jdk_dir="$(ls -d "${JDK_INSTALL_BASE}"/jdk-21* 2>/dev/null | sort -V | tail -n 1 || true)"
-    [ -n "${jdk_dir}" ] || die "JDK 安装目录未找到"
-    ln -sf "${jdk_dir}/bin/java" /usr/local/bin/java
-    ok "JDK 21 安装完成 ($(java_version_line))"
+    printf '%s  %s\n' "${digest}" "${tmp}" | sha256sum -c - || die "Java 下载校验失败，已保留原运行时"
+    # Extract into staging so failures cannot damage an existing/running JVM.
+    staging="${TMP_DIR}/java-extracted"
+    mkdir -p "${staging}" "${JDK_INSTALL_BASE}"
+    tar -xzf "${tmp}" -C "${staging}" || die "Java 解压失败"
+    jdk_dir="${staging}/jdk-${JDK_VERSION}-jre"
+    [ -x "${jdk_dir}/bin/java" ] && java_is_supported "${jdk_dir}/bin/java" || die "Java 解压后版本验证失败"
+    patch_java_blocklist "${jdk_dir}/bin/java"
+    local destination="${JDK_INSTALL_BASE}/ociworker-jre-${JDK_VERSION}"
+    if [ -e "${destination}" ]; then
+        java_is_supported "${destination}/bin/java" || die "已有运行时目录版本无效：${destination}"
+        patch_java_blocklist "${destination}/bin/java"
+    else
+        mv "${jdk_dir}" "${destination}" || die "Java 运行时安装失败"
+    fi
+    ln -sf "${destination}/bin/java" /usr/local/bin/java
+    patch_service_java
+    ok "Java 安装及证书黑名单维护完成 ($(java_version_line /usr/local/bin/java))"
 }
 
 # -----------------------------------------------------------------------------
@@ -1655,6 +1815,14 @@ EOF
 
 main() {
     require_root
+    if [ "${1:-}" = --patch-java-only ]; then
+        patch_java_blocklist "${2:-java}"
+        return
+    fi
+    if [ "${1:-}" = --runtime-only ]; then
+        install_jdk21
+        return
+    fi
     require_systemd
     ARCH="$(detect_arch)"
 
